@@ -37,6 +37,41 @@ TEST_CASE("quaternion inverse rotation round-trips", "[math]")
 	REQUIRE(back.z == Approx(point.z).margin(EPS));
 }
 
+TEST_CASE("quat_from_basis reconstructs a rotation from its axes", "[math]")
+{
+	// 90 deg about Z: local x -> world +y, local y -> world -x, local z -> world +z.
+	const Quat from_basis = quat_from_basis(vec3(0.0F, 1.0F, 0.0F), vec3(-1.0F, 0.0F, 0.0F), vec3(0.0F, 0.0F, 1.0F));
+	const Vec3 mapped_x	  = rotate(from_basis, vec3(1.0F, 0.0F, 0.0F));
+	REQUIRE(mapped_x.x == Approx(0.0F).margin(EPS));
+	REQUIRE(mapped_x.y == Approx(1.0F).margin(EPS));
+
+	// It must agree with the equivalent axis-angle rotation on an arbitrary point.
+	const Quat reference = quat_from_axis_angle(vec3(0.0F, 0.0F, 1.0F), PI_F * 0.5F);
+	const Vec3 probe	 = vec3(0.3F, -0.7F, 1.1F);
+	const Vec3 via_basis = rotate(from_basis, probe);
+	const Vec3 via_axis	 = rotate(reference, probe);
+	REQUIRE(via_basis.x == Approx(via_axis.x).margin(EPS));
+	REQUIRE(via_basis.y == Approx(via_axis.y).margin(EPS));
+	REQUIRE(via_basis.z == Approx(via_axis.z).margin(EPS));
+}
+
+TEST_CASE("symmetric_eigen orders eigenvalues and finds the dominant axis", "[math]")
+{
+	// Diagonal matrix: eigenvalues are the diagonal, returned in descending order.
+	const SymEigen diagonal = symmetric_eigen(SymMat3{.xx = 1.0F, .yy = 5.0F, .zz = 3.0F});
+	REQUIRE(diagonal.values.at(0) == Approx(5.0F).margin(EPS));
+	REQUIRE(diagonal.values.at(1) == Approx(3.0F).margin(EPS));
+	REQUIRE(diagonal.values.at(2) == Approx(1.0F).margin(EPS));
+	REQUIRE(std::abs(diagonal.vectors.at(0).y) == Approx(1.0F).margin(EPS)); // dominant axis is +/-Y
+
+	// A cloud stretched along (1,1,0): cov = 4*(dir dir^T) + I gives eigenvalue 5
+	// along dir and 1 on the other two axes.
+	const SymEigen tilted = symmetric_eigen(SymMat3{.xx = 3.0F, .yy = 3.0F, .zz = 1.0F, .xy = 2.0F});
+	REQUIRE(tilted.values.at(0) == Approx(5.0F).margin(EPS));
+	const Vec3 dir = normalize(vec3(1.0F, 1.0F, 0.0F));
+	REQUIRE(std::abs(dot(tilted.vectors.at(0), dir)) == Approx(1.0F).margin(1.0e-3F));
+}
+
 TEST_CASE("sphere SDF matches distance to centre", "[sdf]")
 {
 	const Sphere sphere{.pos = vec3(0.0F, 0.0F, 0.0F), .radius = 1.0F};
@@ -128,6 +163,27 @@ namespace
 	config.sdf_resolution = 18;
 	return config;
 }
+
+// World-space long axis of a fitted primitive (its local longest extent rotated
+// into world space): +Y for a cylinder, the widest local axis for a box.
+[[nodiscard]] Vec3 primitive_long_axis(const Primitive& prim)
+{
+	if (std::holds_alternative<Cylinder>(prim))
+	{
+		return rotate(std::get<Cylinder>(prim).rot, vec3(0.0F, 1.0F, 0.0F));
+	}
+	const Box& box	 = std::get<Box>(prim);
+	Vec3	   local = vec3(1.0F, 0.0F, 0.0F);
+	if (box.size.y >= box.size.x && box.size.y >= box.size.z)
+	{
+		local = vec3(0.0F, 1.0F, 0.0F);
+	}
+	else if (box.size.z >= box.size.x && box.size.z >= box.size.y)
+	{
+		local = vec3(0.0F, 0.0F, 1.0F);
+	}
+	return rotate(box.rot, local);
+}
 } // namespace
 
 TEST_CASE("decompose fills a cube with a single oriented box", "[decompose]")
@@ -146,6 +202,31 @@ TEST_CASE("decompose fills a cube with a single oriented box", "[decompose]")
 	REQUIRE(box.size.x == Approx(2.0F).margin(0.6F));
 	REQUIRE(box.size.y == Approx(2.0F).margin(0.6F));
 	REQUIRE(box.size.z == Approx(2.0F).margin(0.6F));
+}
+
+TEST_CASE("decompose orients a primitive along an oblique beam", "[decompose]")
+{
+	// A long, thin beam whose axis is rotated 45 deg about Z (an oblique diagonal
+	// in the XY plane). Warm-start PCA should orient the fitted primitive's long
+	// axis along the beam rather than leaving it axis-aligned -- the whole point of
+	// item 1. The beam's world long axis is local +X rotated by `rot`.
+	const Quat	  rot  = quat_from_axis_angle(vec3(0.0F, 0.0F, 1.0F), PI_F * 0.25F);
+	const TriMesh beam = test::make_beam_mesh(vec3(2.5F, 0.55F, 0.55F), rot);
+
+	SolverConfig config	  = fast_config();
+	config.sdf_resolution = 24;
+	config.sample_count	  = 1500;
+	config.gd_iterations  = 80;
+	config.max_primitives = 1; // only the first (deepest-seed) primitive is needed
+
+	const std::vector<Primitive> parts = decompose(beam, config);
+	REQUIRE(!parts.empty());
+	REQUIRE_FALSE(std::holds_alternative<Sphere>(parts.front())); // a sphere has no long axis
+
+	const Vec3 beam_axis = rotate(rot, vec3(1.0F, 0.0F, 0.0F));
+	const Vec3 fit_axis	 = primitive_long_axis(parts.front());
+	// Aligned within ~15 deg (|cos| > ~0.87); an axis-aligned fit would score ~0.71.
+	REQUIRE(std::abs(dot(beam_axis, fit_axis)) > 0.87F);
 }
 
 TEST_CASE("decompose is deterministic and rejects degenerate input", "[decompose]")

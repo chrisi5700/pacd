@@ -251,28 +251,128 @@ struct Seed
 	return seed;
 }
 
-[[nodiscard]] ParamArray seed_params(Kind kind, const Seed& seed)
+// Local shape frame at the seed, used to warm-start orientation and extents. The
+// region is trusted as anisotropic only when it is clearly elongated and there
+// are enough interior samples; otherwise callers fall back to an axis-aligned
+// isotropic guess (identity orientation).
+constexpr float		  FRAME_ANISO_MIN	= 1.25F; // min longest/shortest extent ratio to trust
+constexpr float		  FRAME_ANISO_CAP	= 3.0F;	 // clamp on the elongation used for extents
+constexpr std::size_t FRAME_MIN_SAMPLES = 24;
+
+struct SeedFrame
+{
+	// Principal axes (orthonormal, right-handed, descending extent) and the
+	// per-axis elongation relative to the shortest axis (>= 1, ratio.z == 1).
+	std::array<Vec3, 3> axis{vec3(1.0F, 0.0F, 0.0F), vec3(0.0F, 1.0F, 0.0F), vec3(0.0F, 0.0F, 1.0F)};
+	Vec3				ratio{.x = 1.0F, .y = 1.0F, .z = 1.0F};
+	bool				anisotropic{false};
+};
+
+// Principal-axis analysis of the interior samples around the seed: the covariance
+// of the local interior tells us how the region is oriented and elongated, which
+// warm-starts each primitive's rotation and extents (see README "seeding").
+[[nodiscard]] SeedFrame seed_frame(const std::vector<SamplePoint>& samples, const Seed& seed)
+{
+	SeedFrame	frame;
+	Vec3		mean{};
+	std::size_t count = 0;
+	for (const SamplePoint& smp : samples)
+	{
+		if (smp.mesh_sdf < 0.0F)
+		{
+			mean = mean + (smp.pos - seed.pos);
+			++count;
+		}
+	}
+	if (count < FRAME_MIN_SAMPLES)
+	{
+		return frame; // too little interior to trust -> isotropic fallback
+	}
+
+	const Vec3 centroid = seed.pos + (mean * (1.0F / static_cast<float>(count)));
+	SymMat3	   cov{};
+	for (const SamplePoint& smp : samples)
+	{
+		if (smp.mesh_sdf >= 0.0F)
+		{
+			continue;
+		}
+		const Vec3 off = smp.pos - centroid;
+		cov.xx += off.x * off.x;
+		cov.yy += off.y * off.y;
+		cov.zz += off.z * off.z;
+		cov.xy += off.x * off.y;
+		cov.xz += off.x * off.z;
+		cov.yz += off.y * off.z;
+	}
+
+	const SymEigen eigen	  = symmetric_eigen(cov);
+	const float	   lambda_max = eigen.values.at(0);
+	const float	   lambda_min = std::max(eigen.values.at(2), 1.0e-6F * lambda_max);
+	if (lambda_max <= 0.0F || std::sqrt(lambda_max / lambda_min) < FRAME_ANISO_MIN)
+	{
+		return frame; // essentially isotropic -> isotropic fallback
+	}
+
+	const auto elongation = [&eigen, lambda_min](std::size_t idx)
+	{
+		const float factor = std::sqrt(std::max(eigen.values.at(idx), 0.0F) / lambda_min);
+		return std::clamp(factor, 1.0F, FRAME_ANISO_CAP);
+	};
+	frame.axis.at(0)  = eigen.vectors.at(0);
+	frame.axis.at(1)  = eigen.vectors.at(1);
+	frame.axis.at(2)  = normalize(cross(eigen.vectors.at(0), eigen.vectors.at(1))); // force right-handed
+	frame.ratio		  = vec3(elongation(0), elongation(1), 1.0F);
+	frame.anisotropic = true;
+	return frame;
+}
+
+// Write the oriented quaternion params (slots 6..9) from a local->world rotation.
+void set_orientation(ParamArray& prm, const Quat& rot)
+{
+	prm.at(6) = rot.x;
+	prm.at(7) = rot.y;
+	prm.at(8) = rot.z;
+	prm.at(9) = rot.w;
+}
+
+[[nodiscard]] ParamArray seed_params(Kind kind, const Seed& seed, const SeedFrame& frame)
 {
 	ParamArray	prm{};
 	const float clr = seed.clearance;
 	prm.at(0)		= seed.pos.x;
 	prm.at(1)		= seed.pos.y;
 	prm.at(2)		= seed.pos.z;
-	prm.at(9)		= 1.0F; // identity quaternion
+	prm.at(9)		= 1.0F; // identity quaternion unless a trusted frame overrides it
+
 	if (kind == Kind::SPHERE)
 	{
-		prm.at(3) = 0.8F * clr;
+		prm.at(3) = 0.8F * clr; // a sphere ignores orientation; its home is the inscribed ball
+		return prm;
 	}
-	else if (kind == Kind::BOX)
+
+	if (kind == Kind::BOX)
 	{
-		prm.at(3) = 0.9F * clr;
-		prm.at(4) = 0.9F * clr;
-		prm.at(5) = 0.9F * clr;
+		const Vec3 ratio = frame.anisotropic ? frame.ratio : vec3(1.0F, 1.0F, 1.0F);
+		prm.at(3)		 = 0.9F * clr * ratio.x;
+		prm.at(4)		 = 0.9F * clr * ratio.y;
+		prm.at(5)		 = 0.9F * clr * ratio.z;
+		if (frame.anisotropic)
+		{
+			set_orientation(prm, quat_from_basis(frame.axis.at(0), frame.axis.at(1), frame.axis.at(2)));
+		}
+		return prm;
 	}
-	else
+
+	// Cylinder: seed its long axis (local +Y) along the dominant principal axis,
+	// with the radius left to the constrained minor axes.
+	prm.at(3) = 0.6F * clr;
+	prm.at(4) = 1.0F * clr * (frame.anisotropic ? frame.ratio.x : 1.0F);
+	if (frame.anisotropic)
 	{
-		prm.at(3) = 0.6F * clr;
-		prm.at(4) = 1.0F * clr;
+		const Vec3 axis = frame.axis.at(0);
+		const Vec3 side = frame.axis.at(1);
+		set_orientation(prm, quat_from_basis(side, axis, normalize(cross(side, axis))));
 	}
 	return prm;
 }
@@ -371,11 +471,12 @@ constexpr float SAMPLE_SPAN = 2.5F;
 [[nodiscard]] std::optional<Fit> best_fit(const Seed& seed, const Context& context, const SolverConfig& config,
 										  float scale)
 {
+	const SeedFrame	   frame = seed_frame(*context.samples, seed);
 	std::optional<Fit> best;
 	float			   best_fresh = 0.0F;
 	for (const Kind kind : enabled_kinds(config))
 	{
-		const Fit	fit		   = optimize(kind, seed_params(kind, seed), context, config, scale);
+		const Fit	fit		   = optimize(kind, seed_params(kind, seed, frame), context, config, scale);
 		const float protrusion = (fit.obj.total > 0.0F) ? (fit.obj.total - fit.obj.interior) / fit.obj.total : 1.0F;
 		if (protrusion > config.max_protrusion)
 		{

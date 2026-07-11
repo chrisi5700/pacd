@@ -44,10 +44,13 @@ the mesh surface).
 
 - **Outer loop — place the next primitive (greedy).** Seed the next primitive at
   the **deepest uncovered interior point** (the distance-transform peak of the
-  residual region), then **try every primitive type and keep the best** — the one
-  that captures the most new interior volume. Heuristic type dispatch (elongated
-  region → cylinder, chunky region → box, rounded region → sphere) is a later
-  optimisation.
+  residual region). A PCA of the local interior there yields a **shape frame**
+  that warm-starts each candidate's orientation and anisotropic extents (long
+  axis along the region's dominant direction) instead of starting axis-aligned,
+  so gradient descent *polishes* the fit rather than having to *discover* the
+  rotation from scratch. Then **try every primitive type and keep the best** — the
+  one that captures the most new interior volume. Fully skipping ill-suited types
+  (heuristic dispatch) is a later optimisation.
 
 - **Termination.** Stop at *x %* of the interior filled **or** *n* primitives,
   whichever trips first. The tail (concave corners, thin features) is expensive
@@ -79,7 +82,9 @@ interpolated.
 | Cylinder  | centre (3) + radius (1) + height (1) + quaternion (4) |
 
 Rotations use quaternions — not Euler angles — for well-behaved gradients, and
-are renormalised onto the unit sphere after each step. The cylinder is
+are renormalised onto the unit sphere after each step. They are **initialised
+from the seed's local principal axes** (see the outer loop), not the identity, so
+descent starts already close to the region's orientation. The cylinder is
 axis-symmetric, so one component of its quaternion is redundant (harmless gauge
 freedom).
 
@@ -94,9 +99,11 @@ the harness around it.
   quaternion orientation), the mesh signed-distance field (point-triangle
   distance + generalized winding number, grid-sampled with trilinear lookup), the
   inscribed inner-loop optimiser (Adam + finite-difference gradients over local
-  Monte-Carlo samples), and the greedy driver `decompose(mesh, config)`. Builds
-  clean under the strict `llm-vcpkg` preset and is verified end-to-end (synthetic
-  cube → one oriented box; a real Thingi10K part → an inscribed primitive set).
+  Monte-Carlo samples), PCA-warm-started seeding (the seed's local principal axes
+  orient and pre-size each candidate), and the greedy driver
+  `decompose(mesh, config)`. Builds clean under the strict `llm-vcpkg` preset and
+  is verified end-to-end (synthetic cube → one oriented box; an oblique beam → an
+  orientation-aligned fit; a real Thingi10K part → an inscribed primitive set).
 - **Viewer (`pacd-viewer`):** decomposes each STL and overlays the fitted
   primitives (solid, colour-coded) on the original mesh (a wireframe cage);
   arrow keys cycle files, `T` toggles the cage, and progress is logged. A **Dear
@@ -107,9 +114,11 @@ the harness around it.
   math, the **100-mesh Thingi10K corpus** (see
   [`resources/README.md`](resources/README.md)), and `render_bridge.hpp`
   (`render::Mesh` → solver `TriMesh`).
-- **Next:** BVH acceleration for the mesh SDF (the brute-force grid build
-  dominates on large meshes), running decomposition off the UI thread so the
-  window stays responsive, and heuristic primitive-type dispatch.
+- **Next:** analytic / `so(3)` gradients for the inner loop (exact and
+  better-conditioned than the finite-difference Adam), symmetry-aware seeding
+  (replicate fits across detected mirror / rotational symmetry), BVH acceleration
+  for the mesh SDF (the brute-force grid build dominates on large meshes), and
+  running decomposition off the UI thread so the window stays responsive.
 
 See [`RENDERER.md`](RENDERER.md) for the viewer's controls, headless/CI usage and
 design notes.

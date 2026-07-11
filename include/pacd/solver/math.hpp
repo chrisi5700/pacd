@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <numbers>
 
 namespace pacd::solver
@@ -135,6 +137,157 @@ struct Quat
 	const float half	 = angle * 0.5F;
 	const float sin_half = std::sin(half);
 	return {.x = unit.x * sin_half, .y = unit.y * sin_half, .z = unit.z * sin_half, .w = std::cos(half)};
+}
+
+// Unit quaternion for the rotation whose columns -- the images of the local
+// x/y/z axes -- are the given orthonormal, right-handed basis vectors. Shepperd's
+// method, numerically stable across all orientations (picks the largest divisor).
+[[nodiscard]] inline Quat quat_from_basis(Vec3 col_x, Vec3 col_y, Vec3 col_z) noexcept
+{
+	const float m00	  = col_x.x;
+	const float m10	  = col_x.y;
+	const float m20	  = col_x.z;
+	const float m01	  = col_y.x;
+	const float m11	  = col_y.y;
+	const float m21	  = col_y.z;
+	const float m02	  = col_z.x;
+	const float m12	  = col_z.y;
+	const float m22	  = col_z.z;
+	const float trace = m00 + m11 + m22;
+
+	Quat quat;
+	if (trace > 0.0F)
+	{
+		const float scale = std::sqrt(trace + 1.0F) * 2.0F; // 4 * w
+		quat = {.x = (m21 - m12) / scale, .y = (m02 - m20) / scale, .z = (m10 - m01) / scale, .w = 0.25F * scale};
+	}
+	else if (m00 > m11 && m00 > m22)
+	{
+		const float scale = std::sqrt(((1.0F + m00) - m11) - m22) * 2.0F; // 4 * x
+		quat = {.x = 0.25F * scale, .y = (m01 + m10) / scale, .z = (m02 + m20) / scale, .w = (m21 - m12) / scale};
+	}
+	else if (m11 > m22)
+	{
+		const float scale = std::sqrt(((1.0F + m11) - m00) - m22) * 2.0F; // 4 * y
+		quat = {.x = (m01 + m10) / scale, .y = 0.25F * scale, .z = (m12 + m21) / scale, .w = (m02 - m20) / scale};
+	}
+	else
+	{
+		const float scale = std::sqrt(((1.0F + m22) - m00) - m11) * 2.0F; // 4 * z
+		quat = {.x = (m02 + m20) / scale, .y = (m12 + m21) / scale, .z = 0.25F * scale, .w = (m10 - m01) / scale};
+	}
+	return normalize(quat);
+}
+
+// Symmetric 3x3 matrix (row/column order x, y, z), stored by its upper triangle.
+struct SymMat3
+{
+	float xx{0.0F};
+	float yy{0.0F};
+	float zz{0.0F};
+	float xy{0.0F};
+	float xz{0.0F};
+	float yz{0.0F};
+};
+
+// Eigen-decomposition of a symmetric 3x3 matrix. `values` are in descending
+// order; `vectors[i]` is the unit eigenvector for `values[i]`.
+struct SymEigen
+{
+	std::array<float, 3> values{};
+	std::array<Vec3, 3>	 vectors{};
+};
+
+namespace detail
+{
+using Mat3Rows = std::array<std::array<float, 3>, 3>;
+
+// One symmetric Jacobi rotation that zeroes entry (row, col): updates the working
+// matrix `aij` in place and accumulates the rotation into the eigenvector `basis`.
+inline void jacobi_rotate(Mat3Rows& aij, Mat3Rows& basis, std::size_t row, std::size_t col)
+{
+	const float apq = aij.at(row).at(col);
+	if (std::abs(apq) <= 1.0e-20F)
+	{
+		return;
+	}
+	const float tau	  = (aij.at(col).at(col) - aij.at(row).at(row)) / (2.0F * apq);
+	const float sgn	  = (tau >= 0.0F) ? 1.0F : -1.0F;
+	const float tan_t = sgn / (std::abs(tau) + std::sqrt((tau * tau) + 1.0F));
+	const float cos_t = 1.0F / std::sqrt((tan_t * tan_t) + 1.0F);
+	const float sin_t = tan_t * cos_t;
+	for (std::size_t k = 0; k < 3; ++k) // rotate rows: a <- J^T a
+	{
+		const float a_row = aij.at(row).at(k);
+		const float a_col = aij.at(col).at(k);
+		aij.at(row).at(k) = (cos_t * a_row) - (sin_t * a_col);
+		aij.at(col).at(k) = (sin_t * a_row) + (cos_t * a_col);
+	}
+	for (std::size_t k = 0; k < 3; ++k) // rotate columns of a and accumulate eigenvectors
+	{
+		const float a_row	= aij.at(k).at(row);
+		const float a_col	= aij.at(k).at(col);
+		aij.at(k).at(row)	= (cos_t * a_row) - (sin_t * a_col);
+		aij.at(k).at(col)	= (sin_t * a_row) + (cos_t * a_col);
+		const float v_row	= basis.at(k).at(row);
+		const float v_col	= basis.at(k).at(col);
+		basis.at(k).at(row) = (cos_t * v_row) - (sin_t * v_col);
+		basis.at(k).at(col) = (sin_t * v_row) + (cos_t * v_col);
+	}
+}
+
+// Assemble the eigenpairs from a (near-)diagonalised matrix, sorted descending.
+[[nodiscard]] inline SymEigen order_eigen(const Mat3Rows& aij, const Mat3Rows& basis)
+{
+	std::array<std::size_t, 3> order = {0, 1, 2};
+	const std::array<float, 3> diag	 = {aij.at(0).at(0), aij.at(1).at(1), aij.at(2).at(2)};
+	for (std::size_t i = 0; i < 2; ++i)
+	{
+		for (std::size_t j = i + 1; j < 3; ++j)
+		{
+			if (diag.at(order.at(j)) > diag.at(order.at(i)))
+			{
+				const std::size_t tmp = order.at(i);
+				order.at(i)			  = order.at(j);
+				order.at(j)			  = tmp;
+			}
+		}
+	}
+	SymEigen out;
+	for (std::size_t i = 0; i < 3; ++i)
+	{
+		const std::size_t src = order.at(i);
+		out.values.at(i)	  = diag.at(src);
+		out.vectors.at(i)	  = normalize(vec3(basis.at(0).at(src), basis.at(1).at(src), basis.at(2).at(src)));
+	}
+	return out;
+}
+} // namespace detail
+
+// Diagonalise a symmetric 3x3 matrix with cyclic Jacobi rotations (a handful of
+// sweeps converge to float precision for 3x3) -- dependency-free and enough for
+// the solver's local shape analysis.
+[[nodiscard]] inline SymEigen symmetric_eigen(const SymMat3& mat)
+{
+	using detail::Mat3Rows;
+	Mat3Rows aij   = {std::array<float, 3>{mat.xx, mat.xy, mat.xz}, std::array<float, 3>{mat.xy, mat.yy, mat.yz},
+					  std::array<float, 3>{mat.xz, mat.yz, mat.zz}};
+	Mat3Rows basis = {std::array<float, 3>{1.0F, 0.0F, 0.0F}, std::array<float, 3>{0.0F, 1.0F, 0.0F},
+					  std::array<float, 3>{0.0F, 0.0F, 1.0F}};
+
+	constexpr int MAX_SWEEPS = 16;
+	for (int sweep = 0; sweep < MAX_SWEEPS; ++sweep)
+	{
+		const float off = std::abs(aij.at(0).at(1)) + std::abs(aij.at(0).at(2)) + std::abs(aij.at(1).at(2));
+		if (off <= 1.0e-12F)
+		{
+			break;
+		}
+		detail::jacobi_rotate(aij, basis, 0, 1);
+		detail::jacobi_rotate(aij, basis, 0, 2);
+		detail::jacobi_rotate(aij, basis, 1, 2);
+	}
+	return detail::order_eigen(aij, basis);
 }
 
 } // namespace pacd::solver
