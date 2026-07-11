@@ -53,40 +53,63 @@ the mesh surface).
   whichever trips first. The tail (concave corners, thin features) is expensive
   and left uncovered by design — acceptable for a collision proxy.
 
-### Fit metric
+### Fit objective
 
-Fit is measured as an **SDF-field distance**: the mesh's signed distance field
-vs. the proxy field `min_i d_i` over sampled points, narrow-band weighted around
-the surface, and made **asymmetric** to encode the inscribed preference. The mesh
-SDF uses distance-to-nearest-triangle for magnitude and a generalized winding
-number for sign (robust to the non-watertight / non-manifold meshes in the test
-corpus).
+Each greedy step grows one primitive against a soft-occupancy **volume**
+objective (the "balloon"). With soft occupancy `o(d) = σ(−d/τ)`, the primitive is
+rewarded for the *fresh* interior it captures — the intersection
+`max(d_prim, d_mesh)` of the primitive with the uncovered mesh interior — and
+penalised (weight λ) for any volume that protrudes outside the mesh, which
+enforces inscription. The integral is estimated by Monte-Carlo sampling **locally
+around the seed**, scaled to the local clearance so the objective is
+size-invariant across parts. Gradients are central finite differences; Adam
+drives the update and the quaternion is renormalised each step.
+
+The mesh SDF itself uses distance-to-nearest-triangle for magnitude and a
+generalized winding number for sign — robust to the non-watertight /
+non-manifold meshes in the corpus — sampled on a grid and trilinearly
+interpolated.
 
 ### Primitive parameterisation
 
-| Primitive | Parameters                                             | DoF |
-|-----------|--------------------------------------------------------|-----|
-| Sphere    | centre + radius                                        | 4   |
-| Box       | centre + rotation + half-extents (+ optional rounding) | 9   |
-| Cylinder  | centre + axis (2 DoF, axis-symmetric) + radius + half-height | 7 |
+| Primitive | Optimised parameters                                  |
+|-----------|-------------------------------------------------------|
+| Sphere    | centre (3) + radius (1)                               |
+| Box       | centre (3) + size (3) + quaternion (4)                |
+| Cylinder  | centre (3) + radius (1) + height (1) + quaternion (4) |
 
-Rotations use quaternions / exponential-map (not Euler angles) for well-behaved
-gradients.
+Rotations use quaternions — not Euler angles — for well-behaved gradients, and
+are renormalised onto the unit sphere after each step. The cylinder is
+axis-symmetric, so one component of its quaternion is redundant (harmless gauge
+freedom).
 
 ---
 
 ## Status
 
-Greenfield on the algorithm; the harness around it is in place.
+The decomposition pipeline is implemented and tested; the renderer + corpus are
+the harness around it.
 
-- **Built:** the interactive OpenGL mesh viewer (`pacd-viewer`) for inspecting
-  parts and overlaying a source mesh against its approximation, a `std::expected`
-  STL loader (ASCII + binary), dependency-free `Vec3/Mat4` math, crease-aware
-  normals, and a curated **100-mesh Thingi10K test corpus** (see
-  [`resources/README.md`](resources/README.md)).
-- **Planned:** the mesh-SDF builder, the analytic primitive-SDF library
-  (sphere/box/cylinder + smooth CSG), the inscribed inner-loop optimiser, and the
-  greedy driver.
+- **Solver (`pacd_solver`):** analytic primitive SDFs (sphere/box/cylinder with
+  quaternion orientation), the mesh signed-distance field (point-triangle
+  distance + generalized winding number, grid-sampled with trilinear lookup), the
+  inscribed inner-loop optimiser (Adam + finite-difference gradients over local
+  Monte-Carlo samples), and the greedy driver `decompose(mesh, config)`. Builds
+  clean under the strict `llm-vcpkg` preset and is verified end-to-end (synthetic
+  cube → one oriented box; a real Thingi10K part → an inscribed primitive set).
+- **Viewer (`pacd-viewer`):** decomposes each STL and overlays the fitted
+  primitives (solid, colour-coded) on the original mesh (a wireframe cage);
+  arrow keys cycle files, `T` toggles the cage, and progress is logged. A **Dear
+  ImGui** panel exposes the `SolverConfig` live (budget, vocabulary, resolution,
+  sampling, gradient-descent knobs), so you can retune and re-decompose (`R`)
+  without restarting. See [`RENDERER.md`](RENDERER.md).
+- **Harness:** a `std::expected` STL loader (ASCII + binary), dependency-free
+  math, the **100-mesh Thingi10K corpus** (see
+  [`resources/README.md`](resources/README.md)), and `render_bridge.hpp`
+  (`render::Mesh` → solver `TriMesh`).
+- **Next:** BVH acceleration for the mesh SDF (the brute-force grid build
+  dominates on large meshes), running decomposition off the UI thread so the
+  window stays responsive, and heuristic primitive-type dispatch.
 
 See [`RENDERER.md`](RENDERER.md) for the viewer's controls, headless/CI usage and
 design notes.
@@ -143,5 +166,6 @@ under `src/`, public headers under `include/`.
 
 ## Dependencies
 
-`fmt`, `spdlog` (logging), `glfw3` + `glad` (GL 3.3 loader, viewer only), system
-OpenGL, `catch2` (tests), `benchmark` (benchmarks) — all via `vcpkg.json`.
+`fmt`, `spdlog` (logging), `glfw3` + `glad` (GL 3.3 loader) + `imgui` (config
+panel, viewer only), system OpenGL, `catch2` (tests), `benchmark` (benchmarks) —
+all via `vcpkg.json`.

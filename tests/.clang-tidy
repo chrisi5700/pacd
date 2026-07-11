@@ -87,3 +87,7 @@ CheckOptions:
     value: 'i|j|k|x|y|z|it|id|fd'
   - key: readability-identifier-naming.IgnoredParameterNames
     value: 'x|y|z'
+  - key: readability-identifier-length.IgnoredVariableNames
+    value: 'i|j|k|x|y|z|it|id|fd'
+  - key: readability-identifier-length.IgnoredParameterNames
+    value: 'x|y|z'

@@ -4,8 +4,14 @@
 // GLFW must follow glad.
 #include <GLFW/glfw3.h>
 
+// Dear ImGui + its GLFW/OpenGL3 backends (GL stack must already be included).
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
+
 #include <algorithm>
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -157,11 +163,32 @@ Viewer::Viewer(ViewerOptions options) : m_options(std::move(options)) {
     const std::expected<void, std::string> built = m_shader.build(VERTEX_SRC, FRAGMENT_SRC);
     if (!built) {
         m_error = built.error();
+        return;
     }
+
+    // Dear ImGui for the interactive config panel. The panel is only *drawn* when
+    // the app installs an on_gui callback, so headless/overlay screenshots (which
+    // don't) stay panel-free -- but the context is created unconditionally so an
+    // offscreen framebuffer can still snapshot a panel when asked. The GLFW
+    // backend is installed with chaining (true), so it forwards events to the
+    // input callbacks registered above after updating its own IO.
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::GetIO().IniFilename = nullptr;  // don't litter an imgui.ini
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330 core");
+    m_imgui_ready = true;
 }
 
 Viewer::~Viewer() {
     if (m_window != nullptr) {
+        // Tear down ImGui while the GL context is still current.
+        if (m_imgui_ready) {
+            ImGui_ImplOpenGL3_Shutdown();
+            ImGui_ImplGlfw_Shutdown();
+            ImGui::DestroyContext();
+        }
         // Release GL objects while the context is still current.
         m_gpu.clear();
         m_shader = ShaderProgram{};
@@ -190,6 +217,37 @@ void Viewer::set_scene(Scene new_scene) {
 }
 
 void Viewer::frame_scene() noexcept { m_camera.frame(m_scene.bounds()); }
+
+void Viewer::set_on_cycle(std::function<void(int)> callback) { m_on_cycle = std::move(callback); }
+
+void Viewer::set_on_toggle_original(std::function<void()> callback) { m_on_toggle = std::move(callback); }
+
+void Viewer::set_on_redecompose(std::function<void()> callback) {
+    m_on_redecompose = std::move(callback);
+}
+
+void Viewer::set_on_gui(std::function<void()> callback) { m_on_gui = std::move(callback); }
+
+bool Viewer::should_close() const noexcept {
+    return m_window == nullptr || glfwWindowShouldClose(static_cast<GLFWwindow*>(m_window)) != 0;
+}
+
+bool Viewer::pump() {
+    if (should_close()) {
+        return false;
+    }
+    glfwPollEvents();  // may fire input callbacks (cycle / toggle / re-decompose)
+    draw_once();       // render + present one frame (incl. the ImGui panel)
+    return true;
+}
+
+void Viewer::draw_once() {
+    if (!valid()) {
+        return;
+    }
+    render_frame();
+    glfwSwapBuffers(static_cast<GLFWwindow*>(m_window));
+}
 
 void Viewer::apply_light_uniforms() {
     const std::size_t count = std::min(m_scene.lights.size(), MAX_LIGHTS);
@@ -238,6 +296,16 @@ void Viewer::render_frame() {
     m_shader.set_vec3("u_ambient", m_scene.ambient);
     apply_light_uniforms();
     draw_objects();
+
+    // Overlay the app's ImGui panel (if any) on top of the scene.
+    if (m_imgui_ready && m_on_gui) {
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+        m_on_gui();
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    }
 }
 
 void Viewer::run() {
@@ -312,6 +380,10 @@ void Viewer::handle_cursor(double xpos, double ypos) {
 }
 
 void Viewer::handle_button(int button, int action, double xpos, double ypos) {
+    // Let the panel consume clicks landing on it (don't start an orbit/pan).
+    if (m_imgui_ready && ImGui::GetIO().WantCaptureMouse) {
+        return;
+    }
     const bool pressed = (action == GLFW_PRESS);
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
         m_orbit_active = pressed;
@@ -324,11 +396,19 @@ void Viewer::handle_button(int button, int action, double xpos, double ypos) {
     }
 }
 
-void Viewer::handle_scroll(double y_offset) { m_camera.dolly(static_cast<float>(y_offset)); }
+void Viewer::handle_scroll(double y_offset) {
+    if (m_imgui_ready && ImGui::GetIO().WantCaptureMouse) {
+        return;  // scrolling over the panel adjusts widgets, not the camera
+    }
+    m_camera.dolly(static_cast<float>(y_offset));
+}
 
 void Viewer::handle_key(int key, int action) {
     if (action != GLFW_PRESS) {
         return;
+    }
+    if (m_imgui_ready && ImGui::GetIO().WantCaptureKeyboard) {
+        return;  // a focused ImGui field owns the keyboard
     }
     auto* window = static_cast<GLFWwindow*>(m_window);
     if (key == GLFW_KEY_ESCAPE) {
@@ -341,6 +421,22 @@ void Viewer::handle_key(int key, int action) {
         const std::string name = "pacd-shot-" + std::to_string(m_screenshot_index) + ".png";
         ++m_screenshot_index;
         std::ignore = save_screenshot(name);
+    } else if (key == GLFW_KEY_LEFT) {
+        if (m_on_cycle) {
+            m_on_cycle(-1);
+        }
+    } else if (key == GLFW_KEY_RIGHT) {
+        if (m_on_cycle) {
+            m_on_cycle(1);
+        }
+    } else if (key == GLFW_KEY_T) {
+        if (m_on_toggle) {
+            m_on_toggle();
+        }
+    } else if (key == GLFW_KEY_R) {
+        if (m_on_redecompose) {
+            m_on_redecompose();
+        }
     }
 }
 

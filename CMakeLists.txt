@@ -47,6 +47,10 @@ target_compile_features(logger INTERFACE cxx_std_23)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(glad CONFIG REQUIRED)
 find_package(OpenGL REQUIRED)
+# Dear ImGui (with the GLFW + OpenGL3 backends) drives the viewer's config panel.
+# Its headers come from an IMPORTED target, so they are treated as SYSTEM and do
+# not trip -Werror / clang-tidy.
+find_package(imgui CONFIG REQUIRED)
 
 target_add_library(pacd_render
     src/render/math.cpp
@@ -62,13 +66,27 @@ target_add_library(pacd_render
     src/render/viewer.cpp
 )
 target_include_directories(pacd_render PUBLIC ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(pacd_render PRIVATE glfw glad::glad OpenGL::GL)
+# imgui is PUBLIC: the viewer front-end includes <imgui.h> to build the panel it
+# hands to Viewer::set_on_gui. glfw/glad/GL stay PRIVATE (confined to the .cpp).
+target_link_libraries(pacd_render PRIVATE glfw glad::glad OpenGL::GL PUBLIC imgui::imgui)
 target_compile_features(pacd_render PUBLIC cxx_std_23)
 
 # Interactive viewer executable.
 target_add_executable(pacd-viewer src/viewer_main.cpp)
-target_link_libraries(pacd-viewer PRIVATE pacd_render fmt::fmt)
+target_link_libraries(pacd-viewer PRIVATE pacd_render pacd_solver fmt::fmt)
 target_compile_features(pacd-viewer PRIVATE cxx_std_23)
+
+# ---- Primitive-approximation solver ----
+# Core convex-decomposition library: TriMesh + primitives + the decompose() API.
+# No render/GL dependency; render_bridge.hpp (header-only) is the sole opt-in
+# link to the renderer, used to turn a loaded mesh into the solver's TriMesh.
+target_add_library(pacd_solver
+    src/solver/geometry.cpp
+    src/solver/field.cpp
+    src/solver/decompose.cpp
+)
+target_include_directories(pacd_solver PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_compile_features(pacd_solver PUBLIC cxx_std_23)
 
 add_subdirectory(playground)
 add_subdirectory(bench)

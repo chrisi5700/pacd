@@ -9,3 +9,6 @@ function(add_test_executable TARGET_NAME SRC_FILES)
 endfunction()
 
 add_test_executable(example_test example_test.cpp)
+
+add_test_executable(solver_test solver_test.cpp)
+target_link_libraries(solver_test PRIVATE pacd_solver)
