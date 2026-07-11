@@ -3,9 +3,13 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iterator>
+#include <numeric>
 #include <optional>
 #include <random>
+#include <type_traits>
+#include <variant>
 #include <vector>
 
 #include "pacd/solver/field.hpp"
@@ -623,6 +627,326 @@ constexpr float SAMPLE_SPAN = 2.5F;
 	return best;
 }
 
+// ---- Symmetry-aware seeding ----------------------------------------------
+// A transform T is a symmetry of the shape iff the field is invariant under it
+// (d(x) ~= d(Tx)). We detect the global symmetry group from the SDF and replicate
+// each placed primitive across it, so symmetric regions are filled from one fit.
+
+constexpr float				 SYM_RESIDUAL_FRAC		= 0.03F; // max mean |d(x)-d(Tx)| / bbox diagonal
+constexpr std::size_t		 SYM_MAX_PROBES			= 2000;
+constexpr std::size_t		 SYM_MAX_GROUP			= 16;
+constexpr float				 REPLICA_FRESH_FRACTION = 0.25F; // a replica must be >= this fresh to be kept
+constexpr std::array<int, 6> SYM_ORDERS				= {12, 8, 6, 4, 3, 2};
+
+// A symmetry of the shape: x -> basis * (x - fixed) + fixed, with `basis` an
+// orthogonal 3x3 matrix (proper rotation or improper reflection) stored by its
+// columns, fixed at the solid's centroid.
+struct Isometry
+{
+	Vec3 col0{.x = 1.0F, .y = 0.0F, .z = 0.0F};
+	Vec3 col1{.x = 0.0F, .y = 1.0F, .z = 0.0F};
+	Vec3 col2{.x = 0.0F, .y = 0.0F, .z = 1.0F};
+	Vec3 fixed;
+};
+
+[[nodiscard]] Vec3 linear_map(const Isometry& iso, Vec3 vec)
+{
+	return (iso.col0 * vec.x) + (iso.col1 * vec.y) + (iso.col2 * vec.z);
+}
+
+[[nodiscard]] Vec3 apply_isometry(const Isometry& iso, Vec3 point)
+{
+	return iso.fixed + linear_map(iso, point - iso.fixed);
+}
+
+// Compose two isometries about the same fixed point: basis product A * B.
+[[nodiscard]] Isometry compose(const Isometry& lhs, const Isometry& rhs)
+{
+	return {.col0  = linear_map(lhs, rhs.col0),
+			.col1  = linear_map(lhs, rhs.col1),
+			.col2  = linear_map(lhs, rhs.col2),
+			.fixed = lhs.fixed};
+}
+
+[[nodiscard]] bool same_basis(const Isometry& lhs, const Isometry& rhs)
+{
+	return (length(lhs.col0 - rhs.col0) + length(lhs.col1 - rhs.col1) + length(lhs.col2 - rhs.col2)) < 1.0e-3F;
+}
+
+[[nodiscard]] bool is_identity(const Isometry& iso)
+{
+	return same_basis(iso, Isometry{.fixed = iso.fixed});
+}
+
+[[nodiscard]] Isometry mirror_about(Vec3 axis, Vec3 fixed)
+{
+	const Vec3 unit = normalize(axis); // reflection M = I - 2 n n^T
+	return {.col0  = vec3(1.0F, 0.0F, 0.0F) - (unit * (2.0F * unit.x)),
+			.col1  = vec3(0.0F, 1.0F, 0.0F) - (unit * (2.0F * unit.y)),
+			.col2  = vec3(0.0F, 0.0F, 1.0F) - (unit * (2.0F * unit.z)),
+			.fixed = fixed};
+}
+
+[[nodiscard]] Isometry rotation_about(Vec3 axis, float angle, Vec3 fixed)
+{
+	const Quat rot = quat_from_axis_angle(axis, angle);
+	return {.col0  = rotate(rot, vec3(1.0F, 0.0F, 0.0F)),
+			.col1  = rotate(rot, vec3(0.0F, 1.0F, 0.0F)),
+			.col2  = rotate(rot, vec3(0.0F, 0.0F, 1.0F)),
+			.fixed = fixed};
+}
+
+[[nodiscard]] float invariance_residual(const DistanceField& field, const std::vector<Vec3>& probes,
+										const Isometry& iso)
+{
+	if (probes.empty())
+	{
+		return 1.0e30F;
+	}
+	const float sum =
+		std::transform_reduce(probes.begin(), probes.end(), 0.0F, std::plus<>{}, [&field, &iso](const Vec3& probe)
+							  { return std::abs(field.sample(probe) - field.sample(apply_isometry(iso, probe))); });
+	return sum / static_cast<float>(probes.size());
+}
+
+// Solid centroid, principal axes, and a subsampled set of interior probe points.
+struct SolidFrame
+{
+	Vec3				centroid;
+	std::array<Vec3, 3> axis{vec3(1.0F, 0.0F, 0.0F), vec3(0.0F, 1.0F, 0.0F), vec3(0.0F, 0.0F, 1.0F)};
+	std::vector<Vec3>	probes;
+	bool				ok{false};
+};
+
+[[nodiscard]] SolidFrame solid_frame(const DistanceField& field)
+{
+	std::vector<Vec3> interior;
+	Vec3			  mean{};
+	for (int ciz = 0; ciz < field.nz; ++ciz)
+	{
+		for (int ciy = 0; ciy < field.ny; ++ciy)
+		{
+			for (int cix = 0; cix < field.nx; ++cix)
+			{
+				if (field.data.at(field.linear_index(cix, ciy, ciz)) < 0.0F)
+				{
+					const Vec3 pos = field.node_position(cix, ciy, ciz);
+					interior.push_back(pos);
+					mean = mean + pos;
+				}
+			}
+		}
+	}
+	SolidFrame frame;
+	if (interior.empty())
+	{
+		return frame;
+	}
+	frame.centroid = mean * (1.0F / static_cast<float>(interior.size()));
+	SymMat3 cov{};
+	for (const Vec3& pos : interior)
+	{
+		const Vec3 off = pos - frame.centroid;
+		cov.xx += off.x * off.x;
+		cov.yy += off.y * off.y;
+		cov.zz += off.z * off.z;
+		cov.xy += off.x * off.y;
+		cov.xz += off.x * off.z;
+		cov.yz += off.y * off.z;
+	}
+	frame.axis				 = symmetric_eigen(cov).vectors;
+	const std::size_t stride = std::max<std::size_t>(1, interior.size() / SYM_MAX_PROBES);
+	for (std::size_t idx = 0; idx < interior.size(); idx += stride)
+	{
+		frame.probes.push_back(interior.at(idx));
+	}
+	frame.ok = true;
+	return frame;
+}
+
+// BFS closure of the accepted generators (capped); the group always contains the
+// identity at index 0.
+[[nodiscard]] std::vector<Isometry> close_group(const std::vector<Isometry>& generators, Vec3 centroid)
+{
+	std::vector<Isometry> group{Isometry{.fixed = centroid}};
+	std::size_t			  scan = 0;
+	while (scan < group.size() && group.size() < SYM_MAX_GROUP)
+	{
+		const Isometry current = group.at(scan);
+		++scan;
+		for (const Isometry& gen : generators)
+		{
+			const Isometry prod = compose(gen, current);
+			const bool	   known =
+				std::ranges::any_of(group, [&prod](const Isometry& elem) { return same_basis(elem, prod); });
+			if (!known)
+			{
+				group.push_back(prod);
+				if (group.size() >= SYM_MAX_GROUP)
+				{
+					break;
+				}
+			}
+		}
+	}
+	return group;
+}
+
+// Global symmetry group: identity plus any mirror / n-fold generators detected
+// about the principal axes by SDF invariance.
+[[nodiscard]] std::vector<Isometry> detect_symmetry(const DistanceField& field)
+{
+	const SolidFrame frame = solid_frame(field);
+	if (!frame.ok)
+	{
+		return {Isometry{}};
+	}
+	const float diag =
+		length(vec3(field.cell.x * static_cast<float>(field.nx - 1), field.cell.y * static_cast<float>(field.ny - 1),
+					field.cell.z * static_cast<float>(field.nz - 1)));
+	const float eps = SYM_RESIDUAL_FRAC * diag;
+
+	std::vector<Isometry> generators;
+	for (const Vec3& axis : frame.axis)
+	{
+		const Isometry mir = mirror_about(axis, frame.centroid);
+		if (invariance_residual(field, frame.probes, mir) < eps)
+		{
+			generators.push_back(mir);
+		}
+		for (const int order : SYM_ORDERS) // descending: keep the finest rotation that holds
+		{
+			const Isometry rot = rotation_about(axis, (2.0F * PI_F) / static_cast<float>(order), frame.centroid);
+			if (invariance_residual(field, frame.probes, rot) < eps)
+			{
+				generators.push_back(rot);
+				break;
+			}
+		}
+	}
+	return close_group(generators, frame.centroid);
+}
+
+// Map a primitive through an isometry. Sphere: move the centre. Box / cylinder:
+// move the centre and carry the oriented frame; our primitives are achiral, so an
+// improper (mirror) map is repaired by negating one local axis.
+[[nodiscard]] Primitive transform_primitive(const Primitive& prim, const Isometry& iso)
+{
+	if (std::holds_alternative<Sphere>(prim))
+	{
+		Sphere out = std::get<Sphere>(prim);
+		out.pos	   = apply_isometry(iso, out.pos);
+		return make_primitive(out);
+	}
+	const bool is_box = std::holds_alternative<Box>(prim);
+	const Quat rot	  = is_box ? std::get<Box>(prim).rot : std::get<Cylinder>(prim).rot;
+	const Vec3 pos	  = is_box ? std::get<Box>(prim).pos : std::get<Cylinder>(prim).pos;
+
+	Vec3 col_x = linear_map(iso, rotate(rot, vec3(1.0F, 0.0F, 0.0F)));
+	Vec3 col_y = linear_map(iso, rotate(rot, vec3(0.0F, 1.0F, 0.0F)));
+	Vec3 col_z = linear_map(iso, rotate(rot, vec3(0.0F, 0.0F, 1.0F)));
+	if (dot(col_x, cross(col_y, col_z)) < 0.0F)
+	{
+		col_x = -col_x; // repair handedness after a reflection
+	}
+	const Quat mapped = quat_from_basis(col_x, col_y, col_z);
+	if (is_box)
+	{
+		Box out = std::get<Box>(prim);
+		out.pos = apply_isometry(iso, pos);
+		out.rot = mapped;
+		return make_primitive(out);
+	}
+	Cylinder out = std::get<Cylinder>(prim);
+	out.pos		 = apply_isometry(iso, pos);
+	out.rot		 = mapped;
+	return make_primitive(out);
+}
+
+// Read-only preview of placing `prim`: its protrusion and the interior grid nodes
+// it would newly cover.
+struct Placement
+{
+	float					 protrusion{1.0F};
+	std::size_t				 inside_interior{0};
+	std::vector<std::size_t> fresh_nodes;
+};
+
+[[nodiscard]] Placement preview_placement(const DistanceField& field, const Primitive& prim,
+										  const std::vector<char>& covered)
+{
+	Placement	out;
+	std::size_t inside_total = 0;
+	std::size_t exterior	 = 0;
+	for (int ciz = 0; ciz < field.nz; ++ciz)
+	{
+		for (int ciy = 0; ciy < field.ny; ++ciy)
+		{
+			for (int cix = 0; cix < field.nx; ++cix)
+			{
+				const std::size_t node = field.linear_index(cix, ciy, ciz);
+				if (sd_primitive(field.node_position(cix, ciy, ciz), prim) > 0.0F)
+				{
+					continue;
+				}
+				++inside_total;
+				if (field.data.at(node) >= 0.0F)
+				{
+					++exterior;
+					continue;
+				}
+				++out.inside_interior;
+				if (covered.at(node) == 0)
+				{
+					out.fresh_nodes.push_back(node);
+				}
+			}
+		}
+	}
+	out.protrusion = (inside_total > 0) ? static_cast<float>(exterior) / static_cast<float>(inside_total) : 1.0F;
+	return out;
+}
+
+// Place the symmetric copies of `prim` that land in fresh, inscribed territory,
+// returning the interior added. Each replica is validated independently, so an
+// approximate symmetry can never force a protruding or redundant primitive.
+[[nodiscard]] std::size_t place_orbit(const DistanceField& field, const std::vector<Isometry>& group,
+									  const Primitive& prim, const SolverConfig& config, std::vector<char>& covered,
+									  std::vector<Primitive>& result)
+{
+	const auto	cap			= static_cast<std::size_t>(std::max(config.max_primitives, 0));
+	std::size_t added_total = 0;
+	for (const Isometry& gen : group)
+	{
+		if (is_identity(gen) || result.size() >= cap)
+		{
+			continue;
+		}
+		const Primitive replica = transform_primitive(prim, gen);
+		const Placement place	= preview_placement(field, replica, covered);
+		if (place.protrusion > config.max_protrusion || place.inside_interior == 0)
+		{
+			continue;
+		}
+		if (static_cast<float>(place.fresh_nodes.size()) <
+			REPLICA_FRESH_FRACTION * static_cast<float>(place.inside_interior))
+		{
+			continue; // mostly redundant with what is already covered
+		}
+		for (const std::size_t node : place.fresh_nodes)
+		{
+			covered.at(node) = 1;
+		}
+		added_total += place.fresh_nodes.size();
+		result.push_back(replica);
+		if (config.on_primitive)
+		{
+			config.on_primitive(result.size(), result.back());
+		}
+	}
+	return added_total;
+}
+
 } // namespace
 
 std::vector<Primitive> decompose(const TriMesh& mesh, const SolverConfig& config)
@@ -643,6 +967,10 @@ std::vector<Primitive> decompose(const TriMesh& mesh, const SolverConfig& config
 	{
 		config.on_field_built();
 	}
+
+	// Global symmetry group (identity only when nothing is detected or disabled).
+	const std::vector<Isometry> group =
+		config.use_symmetry ? detect_symmetry(field) : std::vector<Isometry>{Isometry{}};
 
 	std::mt19937	  rng(config.seed);
 	std::vector<char> covered(field.node_count(), 0);
@@ -675,6 +1003,7 @@ std::vector<Primitive> decompose(const TriMesh& mesh, const SolverConfig& config
 			config.on_primitive(result.size(), result.back());
 		}
 		covered_interior += mark_covered(field, best->prim, covered);
+		covered_interior += place_orbit(field, group, best->prim, config, covered, result);
 		const float fraction = static_cast<float>(covered_interior) / static_cast<float>(total_interior);
 		if (fraction >= config.target_coverage)
 		{

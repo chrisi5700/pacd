@@ -52,6 +52,16 @@ the mesh surface).
   one that captures the most new interior volume. Fully skipping ill-suited types
   (heuristic dispatch) is a later optimisation.
 
+- **Symmetry-aware replication.** The shape's global symmetry is detected up front
+  from the SDF — a transform `T` is a symmetry iff the field is invariant under it
+  (`d(x) ≈ d(Tx)`), so candidate mirrors and n-fold rotations about the principal
+  axes are verified by cheap grid resampling. Each placed primitive is then
+  replicated across the detected group, so a symmetric region is filled from a
+  single fit. Replicas are validated independently (the same protrusion + fresh
+  coverage gates), so an approximate symmetry can never force a protruding or
+  redundant primitive — it only ever saves work. On symmetric parts this is 2–4×
+  faster and yields a more consistent decomposition.
+
 - **Termination.** Stop at *x %* of the interior filled **or** *n* primitives,
   whichever trips first. The tail (concave corners, thin features) is expensive
   and left uncovered by design — acceptable for a collision proxy.
@@ -106,10 +116,12 @@ the harness around it.
   inscribed inner-loop optimiser (Adam over **analytic** gradients with an
   **`so(3)`** rotation update and convergence early-stop, on local Monte-Carlo
   samples), PCA-warm-started seeding (the seed's local principal axes
-  orient and pre-size each candidate), and the greedy driver
+  orient and pre-size each candidate), SDF-based symmetry detection with
+  orbit replication of each fit, and the greedy driver
   `decompose(mesh, config)`. Builds clean under the strict `llm-vcpkg` preset and
   is verified end-to-end (synthetic cube → one oriented box; an oblique beam → an
-  orientation-aligned fit; a real Thingi10K part → an inscribed primitive set).
+  orientation-aligned fit; a mirror-symmetric pair → exactly replicated fits; a
+  real Thingi10K part → an inscribed primitive set).
 - **Viewer (`pacd-viewer`):** decomposes each STL and overlays the fitted
   primitives (solid, colour-coded) on the original mesh (a wireframe cage);
   arrow keys cycle files, `T` toggles the cage, and progress is logged. A **Dear
@@ -120,10 +132,10 @@ the harness around it.
   math, the **100-mesh Thingi10K corpus** (see
   [`resources/README.md`](resources/README.md)), and `render_bridge.hpp`
   (`render::Mesh` → solver `TriMesh`).
-- **Next:** symmetry-aware seeding (replicate fits across detected mirror /
-  rotational symmetry), BVH acceleration for the mesh SDF (the brute-force grid
-  build now dominates the wall-clock), and running decomposition off the UI
-  thread so the window stays responsive.
+- **Next:** BVH acceleration for the mesh SDF (the brute-force grid build now
+  dominates the wall-clock), partial/local symmetry (segment first, then detect
+  per-region), and running decomposition off the UI thread so the window stays
+  responsive.
 
 See [`RENDERER.md`](RENDERER.md) for the viewer's controls, headless/CI usage and
 design notes.

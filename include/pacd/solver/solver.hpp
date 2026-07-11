@@ -67,6 +67,12 @@ struct SolverConfig
 	bool use_box{true};
 	bool use_cylinder{true};
 
+	// Detect the mesh's global symmetry (mirror / n-fold about the principal axes)
+	// and replicate each placed primitive across the symmetry group, so symmetric
+	// regions are filled from a single fit. Replicas are validated independently,
+	// so an approximate symmetry never forces a protruding or redundant primitive.
+	bool use_symmetry{true};
+
 	// Optional progress hooks (empty by default), for long-running decompositions.
 	// `on_field_built` fires once after the mesh SDF grid is built; `on_primitive`
 	// fires after each primitive is placed, with the running count.

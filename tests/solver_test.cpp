@@ -184,6 +184,35 @@ namespace
 	}
 	return rotate(box.rot, local);
 }
+
+[[nodiscard]] Vec3 primitive_center(const Primitive& prim)
+{
+	if (std::holds_alternative<Sphere>(prim))
+	{
+		return std::get<Sphere>(prim).pos;
+	}
+	if (std::holds_alternative<Box>(prim))
+	{
+		return std::get<Box>(prim).pos;
+	}
+	return std::get<Cylinder>(prim).pos;
+}
+
+// A scalar summary of a primitive's dimensions -- identical for exact replicas.
+[[nodiscard]] float primitive_size_signature(const Primitive& prim)
+{
+	if (std::holds_alternative<Sphere>(prim))
+	{
+		return std::get<Sphere>(prim).radius;
+	}
+	if (std::holds_alternative<Box>(prim))
+	{
+		const Vec3 size = std::get<Box>(prim).size;
+		return size.x + size.y + size.z;
+	}
+	const Cylinder cyl = std::get<Cylinder>(prim);
+	return cyl.radius + cyl.height;
+}
 } // namespace
 
 TEST_CASE("decompose fills a cube with a single oriented box", "[decompose]")
@@ -227,6 +256,43 @@ TEST_CASE("decompose orients a primitive along an oblique beam", "[decompose]")
 	const Vec3 fit_axis	 = primitive_long_axis(parts.front());
 	// Aligned within ~15 deg (|cos| > ~0.87); an axis-aligned fit would score ~0.71.
 	REQUIRE(std::abs(dot(beam_axis, fit_axis)) > 0.87F);
+}
+
+TEST_CASE("decompose replicates primitives across a mirror symmetry", "[decompose]")
+{
+	// Two disjoint cubes mirrored across x = 0. Symmetry-aware seeding should fit
+	// one lobe and replicate the fit to the other, so every primitive has a mirror
+	// partner with *identical* dimensions -- exactness only replication provides,
+	// since two independent fits would differ by Monte-Carlo noise.
+	const TriMesh mesh	  = test::make_two_box_mesh(0.7F, 1.5F);
+	SolverConfig  config  = fast_config();
+	config.max_primitives = 12;
+
+	const std::vector<Primitive> parts = decompose(mesh, config);
+	REQUIRE(parts.size() >= 2);
+
+	// Both lobes are covered.
+	const auto min_x = std::ranges::min(parts, {}, [](const Primitive& prim) { return primitive_center(prim).x; });
+	const auto max_x = std::ranges::max(parts, {}, [](const Primitive& prim) { return primitive_center(prim).x; });
+	REQUIRE(primitive_center(min_x).x < 0.0F);
+	REQUIRE(primitive_center(max_x).x > 0.0F);
+
+	// Every primitive has an exact-size mirror partner in the opposite lobe.
+	for (const Primitive& prim : parts)
+	{
+		const Vec3	center = primitive_center(prim);
+		const float sig	   = primitive_size_signature(prim);
+		const bool	paired = std::ranges::any_of(parts,
+												 [&](const Primitive& other)
+												 {
+													const Vec3 other_c = primitive_center(other);
+													return std::abs(sig - primitive_size_signature(other)) < EPS &&
+														   std::abs(other_c.x + center.x) < 0.15F &&
+														   std::abs(other_c.y - center.y) < 0.15F &&
+														   std::abs(other_c.z - center.z) < 0.15F;
+												 });
+		REQUIRE(paired);
+	}
 }
 
 TEST_CASE("decompose is deterministic and rejects degenerate input", "[decompose]")
