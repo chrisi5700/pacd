@@ -1,6 +1,17 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
-  "name": "test-project",
+  "name": "pacd",
   "version": "0.1.0",
-  "dependencies": ["catch2", "benchmark", "fmt","spdlog"]
+  "description": "Primitive-approximate convex decomposition of triangle meshes into collision proxies",
+  "dependencies": [
+    "catch2",
+    "benchmark",
+    "fmt",
+    "spdlog",
+    "glfw3",
+    {
+      "name": "glad",
+      "features": ["gl-api-33"]
+    }
+  ]
 }

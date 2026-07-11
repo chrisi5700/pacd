@@ -51,3 +51,9 @@ benchmark_output/
 result/
 flake.lock
 build
+
+# Thingi10K test-corpus scratch (see resources/tools/)
+.venv-thingi/
+.hf-cache/
+.thingi-meta/
+*.stl
