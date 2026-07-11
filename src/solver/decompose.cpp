@@ -21,9 +21,11 @@ namespace
 constexpr float ADAM_BETA1	 = 0.9F;
 constexpr float ADAM_BETA2	 = 0.999F;
 constexpr float ADAM_EPSILON = 1.0e-8F;
-constexpr float QUAT_STEP	 = 1.0e-3F; // finite-difference step for quaternion params
-constexpr int	PARAM_COUNT	 = 10;		// pos(3) + dims(3) + quat(4)
-constexpr int	FIRST_QUAT	 = 6;		// params [6, 10) are the quaternion
+
+// Inner-loop early stop: quit once the relative loss improvement stays below
+// GD_TOLERANCE for GD_PATIENCE consecutive iterations (gd_iterations is the cap).
+constexpr float GD_TOLERANCE = 1.0e-3F;
+constexpr int	GD_PATIENCE	 = 4;
 
 enum class Kind : std::uint8_t
 {
@@ -32,8 +34,25 @@ enum class Kind : std::uint8_t
 	CYLINDER
 };
 
-// pos(0..2), dim0/dim1/dim2 (3..5), quat x/y/z/w (6..9).
-using ParamArray = std::array<float, PARAM_COUNT>;
+// Optimisable parameters of one primitive. `dims` depends on the kind: sphere ->
+// {radius, -, -}; box -> full {size.x, size.y, size.z}; cylinder -> {radius,
+// height, -}. The rotation is a unit quaternion but is updated in its so(3)
+// tangent space, so there is no over-parameterised quaternion to fight.
+struct FitParams
+{
+	Vec3 pos;
+	Vec3 dims;
+	Quat rot;
+};
+
+// Gradient of the loss w.r.t. FitParams; `rot` is the so(3) (body-frame) tangent
+// gradient -- three numbers, not four quaternion components.
+struct FitGrad
+{
+	Vec3 pos;
+	Vec3 dims;
+	Vec3 rot;
+};
 
 // A Monte-Carlo integration point plus the mesh SDF sampled there.
 struct SamplePoint
@@ -74,39 +93,136 @@ template <typename Alt>
 	return prim;
 }
 
-[[nodiscard]] Primitive decode(Kind kind, const ParamArray& prm)
+[[nodiscard]] Primitive decode(Kind kind, const FitParams& prm)
 {
-	const Vec3 pos = vec3(prm.at(0), prm.at(1), prm.at(2));
 	if (kind == Kind::SPHERE)
 	{
-		return make_primitive(Sphere{.pos = pos, .radius = prm.at(3)});
+		return make_primitive(Sphere{.pos = prm.pos, .radius = prm.dims.x});
 	}
-	const Quat rot = normalize(Quat{.x = prm.at(6), .y = prm.at(7), .z = prm.at(8), .w = prm.at(9)});
 	if (kind == Kind::BOX)
 	{
-		return make_primitive(Box{.pos = pos, .size = vec3(prm.at(3), prm.at(4), prm.at(5)), .rot = rot});
+		return make_primitive(Box{.pos = prm.pos, .size = prm.dims, .rot = prm.rot});
 	}
-	return make_primitive(Cylinder{.pos = pos, .radius = prm.at(3), .height = prm.at(4), .rot = rot});
+	return make_primitive(Cylinder{.pos = prm.pos, .radius = prm.dims.x, .height = prm.dims.y, .rot = prm.rot});
 }
 
-[[nodiscard]] std::array<bool, PARAM_COUNT> active_mask(Kind kind)
+// SDF value at `point` plus the analytic gradient of that value w.r.t. the
+// primitive parameters: `pos` in world space, `rot` in the so(3) tangent space,
+// `dims` in their own units. For the oriented shapes the gradient is assembled
+// from the local-space SDF gradient g via pos = -R g and rot = -(local x g).
+struct SampleGrad
 {
-	std::array<bool, PARAM_COUNT> mask{};
-	mask.at(0) = true;
-	mask.at(1) = true;
-	mask.at(2) = true;
-	mask.at(3) = true;
+	float sd{0.0F};
+	Vec3  pos;
+	Vec3  rot;
+	Vec3  dims;
+};
+
+[[nodiscard]] SampleGrad sphere_sample_grad(const FitParams& prm, Vec3 point)
+{
+	const Vec3	rel	   = point - prm.pos;
+	const float len	   = length(rel);
+	const Vec3	normal = (len > 0.0F) ? (rel * (1.0F / len)) : vec3(1.0F, 0.0F, 0.0F);
+	return {.sd = len - prm.dims.x, .pos = -normal, .rot = {}, .dims = vec3(-1.0F, 0.0F, 0.0F)};
+}
+
+[[nodiscard]] SampleGrad box_sample_grad(const FitParams& prm, Vec3 point)
+{
+	const Vec3	local = rotate_inverse(prm.rot, point - prm.pos);
+	const Vec3	half  = prm.dims * 0.5F;
+	const Vec3	qvec  = vec3(std::abs(local.x) - half.x, std::abs(local.y) - half.y, std::abs(local.z) - half.z);
+	const float max_q = std::max({qvec.x, qvec.y, qvec.z});
+
+	Vec3  g_local;
+	Vec3  g_dims;
+	float dist = 0.0F;
+	if (max_q > 0.0F) // outside: dist = |max(q, 0)|; each positive axis contributes
+	{
+		const Vec3	qpos = vec3(std::max(qvec.x, 0.0F), std::max(qvec.y, 0.0F), std::max(qvec.z, 0.0F));
+		const float len	 = length(qpos);
+		dist			 = len;
+		if (len > 0.0F)
+		{
+			const Vec3 dir = qpos * (1.0F / len); // d(dist)/d(q)
+			g_local		   = vec3(dir.x * std::copysign(1.0F, local.x), dir.y * std::copysign(1.0F, local.y),
+								  dir.z * std::copysign(1.0F, local.z));
+			g_dims		   = dir * -0.5F;
+		}
+	}
+	else // inside: dist = max_q; the gradient flows through the nearest face only
+	{
+		dist = max_q;
+		if (qvec.x >= qvec.y && qvec.x >= qvec.z)
+		{
+			g_local = vec3(std::copysign(1.0F, local.x), 0.0F, 0.0F);
+			g_dims	= vec3(-0.5F, 0.0F, 0.0F);
+		}
+		else if (qvec.y >= qvec.z)
+		{
+			g_local = vec3(0.0F, std::copysign(1.0F, local.y), 0.0F);
+			g_dims	= vec3(0.0F, -0.5F, 0.0F);
+		}
+		else
+		{
+			g_local = vec3(0.0F, 0.0F, std::copysign(1.0F, local.z));
+			g_dims	= vec3(0.0F, 0.0F, -0.5F);
+		}
+	}
+	return {.sd = dist, .pos = -rotate(prm.rot, g_local), .rot = -cross(local, g_local), .dims = g_dims};
+}
+
+[[nodiscard]] SampleGrad cylinder_sample_grad(const FitParams& prm, Vec3 point)
+{
+	const Vec3	local	= rotate_inverse(prm.rot, point - prm.pos);
+	const float rho		= std::sqrt((local.x * local.x) + (local.z * local.z));
+	const float inv_rho = (rho > 0.0F) ? (1.0F / rho) : 0.0F;
+	const float radial	= rho - prm.dims.x;						   // dims.x = radius
+	const float axial	= std::abs(local.y) - (prm.dims.y * 0.5F); // dims.y = height
+
+	Vec3  g_local;
+	Vec3  g_dims;
+	float dist = 0.0F;
+	if (radial > 0.0F || axial > 0.0F) // outside
+	{
+		const float rpos = std::max(radial, 0.0F);
+		const float apos = std::max(axial, 0.0F);
+		const float len	 = std::sqrt((rpos * rpos) + (apos * apos));
+		dist			 = len;
+		if (len > 0.0F)
+		{
+			const float d_radial = rpos / len;
+			const float d_axial	 = apos / len;
+			g_local				 = vec3(d_radial * local.x * inv_rho, d_axial * std::copysign(1.0F, local.y),
+										d_radial * local.z * inv_rho);
+			g_dims				 = vec3(-d_radial, -0.5F * d_axial, 0.0F);
+		}
+	}
+	else if (radial >= axial) // inside, the curved wall is nearest
+	{
+		dist	= radial;
+		g_local = vec3(local.x * inv_rho, 0.0F, local.z * inv_rho);
+		g_dims	= vec3(-1.0F, 0.0F, 0.0F);
+	}
+	else // inside, an end cap is nearest
+	{
+		dist	= axial;
+		g_local = vec3(0.0F, std::copysign(1.0F, local.y), 0.0F);
+		g_dims	= vec3(0.0F, -0.5F, 0.0F);
+	}
+	return {.sd = dist, .pos = -rotate(prm.rot, g_local), .rot = -cross(local, g_local), .dims = g_dims};
+}
+
+[[nodiscard]] SampleGrad sample_grad(Kind kind, const FitParams& prm, Vec3 point)
+{
 	if (kind == Kind::SPHERE)
 	{
-		return mask;
+		return sphere_sample_grad(prm, point);
 	}
-	mask.at(4) = true;				  // size.y / height
-	mask.at(5) = (kind == Kind::BOX); // size.z (box only)
-	mask.at(6) = true;
-	mask.at(7) = true;
-	mask.at(8) = true;
-	mask.at(9) = true;
-	return mask;
+	if (kind == Kind::BOX)
+	{
+		return box_sample_grad(prm, point);
+	}
+	return cylinder_sample_grad(prm, point);
 }
 
 [[nodiscard]] Objective evaluate(const Primitive& prim, const Context& context)
@@ -126,71 +242,76 @@ template <typename Alt>
 	return obj;
 }
 
-[[nodiscard]] float loss_at(Kind kind, const ParamArray& prm, const Context& context)
+// Loss and its analytic gradient in a single pass over the samples. The loss is
+//   -sum(occ_in * weight) + lambda * (sum(occ_p) - sum(occ_in)),
+// matching evaluate(); occ_in only responds to the primitive on the branch where
+// it is the active side of max(dist, mesh_sdf).
+struct LossGrad
 {
-	const Objective obj = evaluate(decode(kind, prm), context);
-	return -obj.fresh + (context.lambda * (obj.total - obj.interior));
-}
+	float	loss{0.0F};
+	FitGrad grad;
+};
 
-void compute_gradient(Kind kind, const ParamArray& prm, const std::array<bool, PARAM_COUNT>& active,
-					  const Context& context, float step_len, ParamArray& grad)
+[[nodiscard]] LossGrad loss_and_gradient(Kind kind, const FitParams& prm, const Context& context)
 {
-	for (int prm_i = 0; prm_i < PARAM_COUNT; ++prm_i)
+	const std::vector<SamplePoint>& samples = *context.samples;
+	const std::vector<float>&		weight	= *context.weight;
+	const float						inv_tau = 1.0F / context.tau;
+	LossGrad						out;
+	for (std::size_t idx = 0; idx < samples.size(); ++idx)
 	{
-		const auto slot = static_cast<std::size_t>(prm_i);
-		if (!active.at(slot))
-		{
-			grad.at(slot) = 0.0F;
-			continue;
-		}
-		const float step  = (prm_i < FIRST_QUAT) ? step_len : QUAT_STEP;
-		ParamArray	plus  = prm;
-		ParamArray	minus = prm;
-		plus.at(slot) += step;
-		minus.at(slot) -= step;
-		grad.at(slot) = (loss_at(kind, plus, context) - loss_at(kind, minus, context)) / (2.0F * step);
+		const SampleGrad grad_i = sample_grad(kind, prm, samples.at(idx).pos);
+		const float		 mesh	= samples.at(idx).mesh_sdf;
+		const float		 occ_p	= occupancy(grad_i.sd, context.tau);
+		const float		 occ_in = occupancy(std::max(grad_i.sd, mesh), context.tau);
+		out.loss += -(occ_in * weight.at(idx)) + (context.lambda * (occ_p - occ_in));
+
+		// d(occupancy)/d(dist) = -inv_tau * occ * (1 - occ); occ_in tracks the
+		// primitive only when the primitive is the active side of max(dist, mesh).
+		const float d_occ_p	 = -inv_tau * occ_p * (1.0F - occ_p);
+		const float d_occ_in = (grad_i.sd > mesh) ? (-inv_tau * occ_in * (1.0F - occ_in)) : 0.0F;
+		const float adjoint	 = (-weight.at(idx) * d_occ_in) + (context.lambda * (d_occ_p - d_occ_in));
+
+		out.grad.pos  = out.grad.pos + (grad_i.pos * adjoint);
+		out.grad.dims = out.grad.dims + (grad_i.dims * adjoint);
+		out.grad.rot  = out.grad.rot + (grad_i.rot * adjoint);
 	}
+	return out;
 }
 
 struct AdamState
 {
-	ParamArray moment1{};
-	ParamArray moment2{};
+	FitGrad moment1;
+	FitGrad moment2;
 };
 
-void adam_step(const std::array<bool, PARAM_COUNT>& active, const ParamArray& grad, AdamState& adam, int iter,
-			   float lr_len, float lr_rot, ParamArray& prm)
+// One Adam coordinate update for a 3-vector, returning the amount to subtract.
+[[nodiscard]] Vec3 adam_delta(Vec3 grad, Vec3& moment1, Vec3& moment2, float bias1, float bias2, float rate)
 {
-	const float bias1 = 1.0F - std::pow(ADAM_BETA1, static_cast<float>(iter + 1));
-	const float bias2 = 1.0F - std::pow(ADAM_BETA2, static_cast<float>(iter + 1));
-	for (int prm_i = 0; prm_i < PARAM_COUNT; ++prm_i)
-	{
-		const auto slot = static_cast<std::size_t>(prm_i);
-		if (!active.at(slot))
-		{
-			continue;
-		}
-		const float grd		  = grad.at(slot);
-		adam.moment1.at(slot) = (ADAM_BETA1 * adam.moment1.at(slot)) + ((1.0F - ADAM_BETA1) * grd);
-		adam.moment2.at(slot) = (ADAM_BETA2 * adam.moment2.at(slot)) + ((1.0F - ADAM_BETA2) * grd * grd);
-		const float mhat	  = adam.moment1.at(slot) / bias1;
-		const float vhat	  = adam.moment2.at(slot) / bias2;
-		const float rate	  = (prm_i < FIRST_QUAT) ? lr_len : lr_rot;
-		prm.at(slot) -= rate * mhat / (std::sqrt(vhat) + ADAM_EPSILON);
-	}
+	moment1			= (ADAM_BETA1 * moment1) + ((1.0F - ADAM_BETA1) * grad);
+	moment2			= vec3((ADAM_BETA2 * moment2.x) + ((1.0F - ADAM_BETA2) * grad.x * grad.x),
+						   (ADAM_BETA2 * moment2.y) + ((1.0F - ADAM_BETA2) * grad.y * grad.y),
+						   (ADAM_BETA2 * moment2.z) + ((1.0F - ADAM_BETA2) * grad.z * grad.z));
+	const Vec3 mhat = moment1 * (1.0F / bias1);
+	const Vec3 vhat = moment2 * (1.0F / bias2);
+	return vec3((rate * mhat.x) / (std::sqrt(vhat.x) + ADAM_EPSILON),
+				(rate * mhat.y) / (std::sqrt(vhat.y) + ADAM_EPSILON),
+				(rate * mhat.z) / (std::sqrt(vhat.z) + ADAM_EPSILON));
 }
 
-// Clamp dimensions positive and renormalize the quaternion back onto the unit sphere.
-void sanitize(ParamArray& prm, float min_dim)
+// Keep the active dimensions positive (which ones are active depends on the kind).
+void clamp_dims(Kind kind, FitParams& prm, float min_dim)
 {
-	prm.at(3)		= std::max(prm.at(3), min_dim);
-	prm.at(4)		= std::max(prm.at(4), min_dim);
-	prm.at(5)		= std::max(prm.at(5), min_dim);
-	const Quat norm = normalize(Quat{.x = prm.at(6), .y = prm.at(7), .z = prm.at(8), .w = prm.at(9)});
-	prm.at(6)		= norm.x;
-	prm.at(7)		= norm.y;
-	prm.at(8)		= norm.z;
-	prm.at(9)		= norm.w;
+	prm.dims.x = std::max(prm.dims.x, min_dim); // radius / size.x, always used
+	if (kind == Kind::BOX)
+	{
+		prm.dims.y = std::max(prm.dims.y, min_dim);
+		prm.dims.z = std::max(prm.dims.z, min_dim);
+	}
+	else if (kind == Kind::CYLINDER)
+	{
+		prm.dims.y = std::max(prm.dims.y, min_dim); // height
+	}
 }
 
 struct Fit
@@ -199,20 +320,42 @@ struct Fit
 	Objective obj;
 };
 
-[[nodiscard]] Fit optimize(Kind kind, ParamArray prm, const Context& context, const SolverConfig& config, float scale)
+[[nodiscard]] Fit optimize(Kind kind, FitParams prm, const Context& context, const SolverConfig& config, float scale)
 {
-	const std::array<bool, PARAM_COUNT> active	 = active_mask(kind);
-	const float							step_len = 0.2F * context.tau; // finite-diff step resolves the band
-	const float							min_dim	 = 0.02F * scale;
-	const float							lr_len	 = config.learning_rate * scale;
-	const float							lr_rot	 = config.learning_rate;
-	AdamState							adam;
+	const float min_dim = 0.02F * scale;
+	const float lr_len	= config.learning_rate * scale; // world-unit params scale with clearance
+	const float lr_rot	= config.learning_rate;			// rotation steps are already dimensionless
+	AdamState	adam;
+	float		prev_loss = 0.0F;
+	int			stalled	  = 0;
 	for (int iter = 0; iter < config.gd_iterations; ++iter)
 	{
-		ParamArray grad{};
-		compute_gradient(kind, prm, active, context, step_len, grad);
-		adam_step(active, grad, adam, iter, lr_len, lr_rot, prm);
-		sanitize(prm, min_dim);
+		const LossGrad step	 = loss_and_gradient(kind, prm, context);
+		const float	   bias1 = 1.0F - std::pow(ADAM_BETA1, static_cast<float>(iter + 1));
+		const float	   bias2 = 1.0F - std::pow(ADAM_BETA2, static_cast<float>(iter + 1));
+
+		prm.pos	 = prm.pos - adam_delta(step.grad.pos, adam.moment1.pos, adam.moment2.pos, bias1, bias2, lr_len);
+		prm.dims = prm.dims - adam_delta(step.grad.dims, adam.moment1.dims, adam.moment2.dims, bias1, bias2, lr_len);
+		if (kind != Kind::SPHERE)
+		{
+			// so(3) tangent step composed onto the quaternion: R <- R * exp([theta]).
+			const Vec3 theta = -adam_delta(step.grad.rot, adam.moment1.rot, adam.moment2.rot, bias1, bias2, lr_rot);
+			prm.rot			 = normalize(prm.rot * quat_from_axis_angle(theta, length(theta)));
+		}
+		clamp_dims(kind, prm, min_dim);
+
+		if (iter > 0 && std::abs(prev_loss - step.loss) <= GD_TOLERANCE * (std::abs(prev_loss) + ADAM_EPSILON))
+		{
+			if (++stalled >= GD_PATIENCE)
+			{
+				break; // converged: the loss has essentially stopped improving
+			}
+		}
+		else
+		{
+			stalled = 0;
+		}
+		prev_loss = step.loss;
 	}
 	const Primitive prim = decode(kind, prm);
 	return {.prim = prim, .obj = evaluate(prim, context)};
@@ -327,52 +470,36 @@ struct SeedFrame
 	return frame;
 }
 
-// Write the oriented quaternion params (slots 6..9) from a local->world rotation.
-void set_orientation(ParamArray& prm, const Quat& rot)
+[[nodiscard]] FitParams seed_params(Kind kind, const Seed& seed, const SeedFrame& frame)
 {
-	prm.at(6) = rot.x;
-	prm.at(7) = rot.y;
-	prm.at(8) = rot.z;
-	prm.at(9) = rot.w;
-}
-
-[[nodiscard]] ParamArray seed_params(Kind kind, const Seed& seed, const SeedFrame& frame)
-{
-	ParamArray	prm{};
 	const float clr = seed.clearance;
-	prm.at(0)		= seed.pos.x;
-	prm.at(1)		= seed.pos.y;
-	prm.at(2)		= seed.pos.z;
-	prm.at(9)		= 1.0F; // identity quaternion unless a trusted frame overrides it
+	FitParams	prm{.pos = seed.pos, .dims = {}, .rot = {}}; // identity rotation by default
 
 	if (kind == Kind::SPHERE)
 	{
-		prm.at(3) = 0.8F * clr; // a sphere ignores orientation; its home is the inscribed ball
+		prm.dims = vec3(0.8F * clr, 0.0F, 0.0F); // a sphere ignores orientation; home is the inscribed ball
 		return prm;
 	}
 
 	if (kind == Kind::BOX)
 	{
 		const Vec3 ratio = frame.anisotropic ? frame.ratio : vec3(1.0F, 1.0F, 1.0F);
-		prm.at(3)		 = 0.9F * clr * ratio.x;
-		prm.at(4)		 = 0.9F * clr * ratio.y;
-		prm.at(5)		 = 0.9F * clr * ratio.z;
+		prm.dims		 = vec3(0.9F * clr * ratio.x, 0.9F * clr * ratio.y, 0.9F * clr * ratio.z);
 		if (frame.anisotropic)
 		{
-			set_orientation(prm, quat_from_basis(frame.axis.at(0), frame.axis.at(1), frame.axis.at(2)));
+			prm.rot = quat_from_basis(frame.axis.at(0), frame.axis.at(1), frame.axis.at(2));
 		}
 		return prm;
 	}
 
 	// Cylinder: seed its long axis (local +Y) along the dominant principal axis,
 	// with the radius left to the constrained minor axes.
-	prm.at(3) = 0.6F * clr;
-	prm.at(4) = 1.0F * clr * (frame.anisotropic ? frame.ratio.x : 1.0F);
+	prm.dims = vec3(0.6F * clr, 1.0F * clr * (frame.anisotropic ? frame.ratio.x : 1.0F), 0.0F);
 	if (frame.anisotropic)
 	{
 		const Vec3 axis = frame.axis.at(0);
 		const Vec3 side = frame.axis.at(1);
-		set_orientation(prm, quat_from_basis(side, axis, normalize(cross(side, axis))));
+		prm.rot			= quat_from_basis(side, axis, normalize(cross(side, axis)));
 	}
 	return prm;
 }

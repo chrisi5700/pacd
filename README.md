@@ -65,8 +65,12 @@ rewarded for the *fresh* interior it captures — the intersection
 penalised (weight λ) for any volume that protrudes outside the mesh, which
 enforces inscription. The integral is estimated by Monte-Carlo sampling **locally
 around the seed**, scaled to the local clearance so the objective is
-size-invariant across parts. Gradients are central finite differences; Adam
-drives the update and the quaternion is renormalised each step.
+size-invariant across parts. The objective is differentiable in closed form, so
+gradients are **analytic** — one pass over the samples rather than a central
+finite difference per parameter — and the rotation is updated in its **`so(3)`**
+tangent space (`R ← R·exp[θ]`) instead of nudging quaternion components and
+renormalising. Adam drives the step, and descent **stops early** once the loss
+stops improving (capped at `gd_iterations`).
 
 The mesh SDF itself uses distance-to-nearest-triangle for magnitude and a
 generalized winding number for sign — robust to the non-watertight /
@@ -81,12 +85,13 @@ interpolated.
 | Box       | centre (3) + size (3) + quaternion (4)                |
 | Cylinder  | centre (3) + radius (1) + height (1) + quaternion (4) |
 
-Rotations use quaternions — not Euler angles — for well-behaved gradients, and
-are renormalised onto the unit sphere after each step. They are **initialised
-from the seed's local principal axes** (see the outer loop), not the identity, so
-descent starts already close to the region's orientation. The cylinder is
-axis-symmetric, so one component of its quaternion is redundant (harmless gauge
-freedom).
+Rotations are carried as quaternions — not Euler angles — but are **optimised in
+the `so(3)` tangent space** (an incremental body-frame update composed onto the
+quaternion), which is better-conditioned than nudging the four quaternion
+components and needing to renormalise. They are **initialised from the seed's
+local principal axes** (see the outer loop), not the identity, so descent starts
+already close to the region's orientation. The cylinder is axis-symmetric, so its
+rotation about the long axis is a harmless gauge freedom.
 
 ---
 
@@ -98,8 +103,9 @@ the harness around it.
 - **Solver (`pacd_solver`):** analytic primitive SDFs (sphere/box/cylinder with
   quaternion orientation), the mesh signed-distance field (point-triangle
   distance + generalized winding number, grid-sampled with trilinear lookup), the
-  inscribed inner-loop optimiser (Adam + finite-difference gradients over local
-  Monte-Carlo samples), PCA-warm-started seeding (the seed's local principal axes
+  inscribed inner-loop optimiser (Adam over **analytic** gradients with an
+  **`so(3)`** rotation update and convergence early-stop, on local Monte-Carlo
+  samples), PCA-warm-started seeding (the seed's local principal axes
   orient and pre-size each candidate), and the greedy driver
   `decompose(mesh, config)`. Builds clean under the strict `llm-vcpkg` preset and
   is verified end-to-end (synthetic cube → one oriented box; an oblique beam → an
@@ -114,11 +120,10 @@ the harness around it.
   math, the **100-mesh Thingi10K corpus** (see
   [`resources/README.md`](resources/README.md)), and `render_bridge.hpp`
   (`render::Mesh` → solver `TriMesh`).
-- **Next:** analytic / `so(3)` gradients for the inner loop (exact and
-  better-conditioned than the finite-difference Adam), symmetry-aware seeding
-  (replicate fits across detected mirror / rotational symmetry), BVH acceleration
-  for the mesh SDF (the brute-force grid build dominates on large meshes), and
-  running decomposition off the UI thread so the window stays responsive.
+- **Next:** symmetry-aware seeding (replicate fits across detected mirror /
+  rotational symmetry), BVH acceleration for the mesh SDF (the brute-force grid
+  build now dominates the wall-clock), and running decomposition off the UI
+  thread so the window stays responsive.
 
 See [`RENDERER.md`](RENDERER.md) for the viewer's controls, headless/CI usage and
 design notes.
