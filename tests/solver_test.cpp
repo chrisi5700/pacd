@@ -258,6 +258,35 @@ TEST_CASE("decompose orients a primitive along an oblique beam", "[decompose]")
 	REQUIRE(std::abs(dot(beam_axis, fit_axis)) > 0.87F);
 }
 
+TEST_CASE("decompose grows one long primitive along an elongated feature", "[decompose]")
+{
+	// A long beam (6 x 1 x 1). With a clearance-scaled isotropic window this used
+	// to fragment into several short boxes with gaps (the growth gradient was zero
+	// past ~2.5x clearance); the oriented, recentred window + extent-based init
+	// should now span nearly the whole length with a single box.
+	const TriMesh beam	 = test::make_beam_mesh(vec3(3.0F, 0.5F, 0.5F), Quat{});
+	SolverConfig  config = fast_config();
+	config.sdf_resolution = 32;
+	config.sample_count	  = 1200;
+	config.gd_iterations  = 80;
+	config.max_primitives = 16;
+
+	const std::vector<Primitive> parts = decompose(beam, config);
+	REQUIRE(!parts.empty());
+
+	float longest = 0.0F;
+	for (const Primitive& prim : parts)
+	{
+		if (std::holds_alternative<Box>(prim))
+		{
+			const Vec3 size = std::get<Box>(prim).size;
+			longest			= std::max({longest, size.x, size.y, size.z});
+		}
+	}
+	REQUIRE(longest > 4.0F);	// one box spans most of the beam (was a ~2.5 fragment)
+	REQUIRE(parts.size() <= 5); // no longer shattered into many short pieces
+}
+
 TEST_CASE("decompose replicates primitives across a mirror symmetry", "[decompose]")
 {
 	// Two disjoint cubes mirrored across x = 0. Symmetry-aware seeding should fit

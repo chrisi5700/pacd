@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <iterator>
+#include <numbers>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -474,21 +475,34 @@ struct SeedFrame
 	return frame;
 }
 
-[[nodiscard]] FitParams seed_params(Kind kind, const Seed& seed, const SeedFrame& frame)
+// The feature's true extent, measured from a window that spans it: the centroid
+// of the interior samples and their full spread along each principal axis. This
+// is what the primitive is initialised to, so gradient descent polishes rather
+// than having to grow across the whole feature (which the clearance-scaled step
+// cannot do in the iteration budget).
+struct FeatureExtent
 {
-	const float clr = seed.clearance;
-	FitParams	prm{.pos = seed.pos, .dims = {}, .rot = {}}; // identity rotation by default
+	Vec3 center;
+	Vec3 extent; // full extent along frame.axis[0], [1], [2]
+};
+
+[[nodiscard]] FitParams seed_params(Kind kind, const Seed& seed, const SeedFrame& frame, const FeatureExtent& feature)
+{
+	const float clr		  = seed.clearance;
+	const float dim_floor = 0.4F * clr; // keep degenerate extents off zero
+	const Vec3 extent = vec3(std::max(0.9F * feature.extent.x, dim_floor), std::max(0.9F * feature.extent.y, dim_floor),
+							 std::max(0.9F * feature.extent.z, dim_floor));
 
 	if (kind == Kind::SPHERE)
 	{
-		prm.dims = vec3(0.8F * clr, 0.0F, 0.0F); // a sphere ignores orientation; home is the inscribed ball
-		return prm;
+		// A sphere ignores orientation; its home is the maximal inscribed ball.
+		return {.pos = seed.pos, .dims = vec3(0.8F * clr, 0.0F, 0.0F), .rot = {}};
 	}
 
+	FitParams prm{.pos = feature.center, .dims = {}, .rot = {}};
 	if (kind == Kind::BOX)
 	{
-		const Vec3 ratio = frame.anisotropic ? frame.ratio : vec3(1.0F, 1.0F, 1.0F);
-		prm.dims		 = vec3(0.9F * clr * ratio.x, 0.9F * clr * ratio.y, 0.9F * clr * ratio.z);
+		prm.dims = extent; // span the measured feature extent along each axis
 		if (frame.anisotropic)
 		{
 			prm.rot = quat_from_basis(frame.axis.at(0), frame.axis.at(1), frame.axis.at(2));
@@ -496,9 +510,9 @@ struct SeedFrame
 		return prm;
 	}
 
-	// Cylinder: seed its long axis (local +Y) along the dominant principal axis,
-	// with the radius left to the constrained minor axes.
-	prm.dims = vec3(0.6F * clr, 1.0F * clr * (frame.anisotropic ? frame.ratio.x : 1.0F), 0.0F);
+	// Cylinder: long axis (local +Y) along the dominant principal axis; radius from
+	// the measured cross-section.
+	prm.dims = vec3(std::max(0.5F * std::min(extent.y, extent.z), dim_floor), extent.x, 0.0F);
 	if (frame.anisotropic)
 	{
 		const Vec3 axis = frame.axis.at(0);
@@ -508,15 +522,22 @@ struct SeedFrame
 	return prm;
 }
 
-// How far the local sample box extends, as a multiple of the seed clearance.
-// Big enough to contain the growing primitive plus a protrusion shell (the mesh
-// surface sits at ~1x clearance), small enough that the interior is well sampled
-// even for thin parts whose interior is a tiny fraction of the whole bbox.
+// Window half-width across a thin axis, as a multiple of the seed clearance. Big
+// enough to hold the primitive plus a protrusion shell (the mesh surface sits at
+// ~1x clearance), small enough that a thin part's interior is still well sampled.
 constexpr float SAMPLE_SPAN = 2.5F;
 
-// Monte-Carlo points in a box around the seed, each carrying the mesh SDF there.
-// Local sampling keeps the objective well-conditioned regardless of overall mesh
-// size or how thin the part is.
+// Window half-length along an *elongated* axis. The isotropic SAMPLE_SPAN window
+// is tied to the cross-sectional clearance, so it cannot see past ~2.5x clearance
+// along a long feature -- the growth gradient there is zero and cylinders/boxes
+// stall (short pieces with gaps). Stretching the window along the detected long
+// axis lets the objective see, and grow into, the whole feature.
+constexpr float REACH_SPAN		= 10.0F;
+constexpr float REACH_RATIO_MIN = 1.3F; // frame elongation above which an axis is "long"
+
+// Isotropic clearance-scaled window around the seed -- used to probe the local
+// shape (its interior covariance yields the seed frame). Each point carries the
+// mesh SDF sampled there.
 [[nodiscard]] std::vector<SamplePoint> local_samples(const DistanceField& field, const Seed& seed,
 													 const SolverConfig& config, std::mt19937& rng)
 {
@@ -530,6 +551,106 @@ constexpr float SAMPLE_SPAN = 2.5F;
 		samples.push_back({.pos = pos, .mesh_sdf = field.sample(pos)});
 	}
 	return samples;
+}
+
+// Oriented sample window aligned to the seed frame: stretched to REACH_SPAN along
+// each elongated principal axis, thin (SAMPLE_SPAN) across the rest. With an
+// isotropic frame this reduces to the axis-aligned clearance cube. This is what
+// lets the optimiser grow a primitive along a long feature instead of stalling.
+[[nodiscard]] std::vector<SamplePoint> oriented_samples(const DistanceField& field, const Seed& seed,
+														const SeedFrame& frame, const SolverConfig& config,
+														std::mt19937& rng)
+{
+	const float max_reach = 0.5F * length(vec3(field.cell.x * static_cast<float>(field.nx - 1),
+											   field.cell.y * static_cast<float>(field.ny - 1),
+											   field.cell.z * static_cast<float>(field.nz - 1)));
+	const auto	span	  = [&](float ratio)
+	{
+		const bool elongated = frame.anisotropic && (ratio > REACH_RATIO_MIN);
+		return elongated ? std::min(REACH_SPAN * seed.clearance, max_reach) : (SAMPLE_SPAN * seed.clearance);
+	};
+	const Vec3 ext = vec3(span(frame.ratio.x), span(frame.ratio.y), span(frame.ratio.z));
+
+	std::uniform_real_distribution<float> unit(-1.0F, 1.0F);
+	std::vector<SamplePoint>			  samples;
+	samples.reserve(static_cast<std::size_t>(std::max(config.sample_count, 0)));
+	for (int idx = 0; idx < config.sample_count; ++idx)
+	{
+		const Vec3 offset = vec3(unit(rng) * ext.x, unit(rng) * ext.y, unit(rng) * ext.z);
+		const Vec3 pos =
+			seed.pos + (frame.axis.at(0) * offset.x) + (frame.axis.at(1) * offset.y) + (frame.axis.at(2) * offset.z);
+		samples.push_back({.pos = pos, .mesh_sdf = field.sample(pos)});
+	}
+	return samples;
+}
+
+// Measure the feature's extent from the oriented window: the centroid and the
+// full spread of the *interior* samples along each frame axis. Exterior samples
+// are excluded, so an over-sized window still yields the true feature extent.
+[[nodiscard]] FeatureExtent measure_extent(const std::vector<SamplePoint>& samples, const SeedFrame& frame,
+										   const Seed& seed)
+{
+	Vec3		mean{};
+	std::size_t count = 0;
+	for (const SamplePoint& smp : samples)
+	{
+		if (smp.mesh_sdf < 0.0F)
+		{
+			mean = mean + smp.pos;
+			++count;
+		}
+	}
+	const float span = 2.0F * seed.clearance;
+	if (count < FRAME_MIN_SAMPLES)
+	{
+		return {.center = seed.pos, .extent = vec3(span, span, span)};
+	}
+	const Vec3 center = mean * (1.0F / static_cast<float>(count));
+	Vec3	   var{};
+	for (const SamplePoint& smp : samples)
+	{
+		if (smp.mesh_sdf >= 0.0F)
+		{
+			continue;
+		}
+		const Vec3	off	  = smp.pos - center;
+		const float proj0 = dot(off, frame.axis.at(0));
+		const float proj1 = dot(off, frame.axis.at(1));
+		const float proj2 = dot(off, frame.axis.at(2));
+		var				  = var + vec3(proj0 * proj0, proj1 * proj1, proj2 * proj2);
+	}
+	var					= var * (1.0F / static_cast<float>(count));
+	const float scale_k = 2.0F * std::numbers::sqrt3_v<float>; // uniform on [-a, a]: var = a^2/3 -> full extent 2a
+	return {.center = center,
+			.extent = vec3(scale_k * std::sqrt(std::max(var.x, 0.0F)), scale_k * std::sqrt(std::max(var.y, 0.0F)),
+						   scale_k * std::sqrt(std::max(var.z, 0.0F)))};
+}
+
+// The seed can sit at a feature *end* (find_seed returns the first deepest node),
+// so an end-centred window only covers part of a long feature. Recentre the
+// oriented window onto the interior centroid a few times so it spans the whole
+// feature before the extent it reports is used to size (and sample) the fit.
+constexpr int SAMPLE_RECENTER_PASSES = 3;
+
+struct LocalWindow
+{
+	std::vector<SamplePoint> samples;
+	FeatureExtent			 feature;
+};
+
+[[nodiscard]] LocalWindow centered_window(const DistanceField& field, const Seed& seed, const SeedFrame& frame,
+										  const SolverConfig& config, std::mt19937& rng)
+{
+	Seed					 probe	 = seed;
+	std::vector<SamplePoint> samples = oriented_samples(field, probe, frame, config, rng);
+	FeatureExtent			 feature = measure_extent(samples, frame, probe);
+	for (int pass = 0; pass < SAMPLE_RECENTER_PASSES; ++pass)
+	{
+		probe.pos = feature.center;
+		samples	  = oriented_samples(field, probe, frame, config, rng);
+		feature	  = measure_extent(samples, frame, probe);
+	}
+	return {.samples = std::move(samples), .feature = feature};
 }
 
 // Sample weights: 0 where already covered by a placed primitive, else 1.
@@ -598,28 +719,86 @@ constexpr float SAMPLE_SPAN = 2.5F;
 	return kinds;
 }
 
-// Try every enabled primitive type at the seed; keep the best inscribed fit.
-[[nodiscard]] std::optional<Fit> best_fit(const Seed& seed, const Context& context, const SolverConfig& config,
-										  float scale)
+// The grid coverage state, bundled so the scoring helpers stay under the
+// parameter limit.
+struct GridView
 {
-	const SeedFrame	   frame = seed_frame(*context.samples, seed);
+	const DistanceField*	 field{nullptr};
+	const std::vector<char>* covered{nullptr};
+	std::size_t				 total_interior{0};
+};
+
+// Read-only preview of placing `prim` against the grid (the true field): its
+// protrusion and the interior nodes it would newly cover. Used both to select the
+// best fit and to validate symmetry replicas, so the gates never depend on where
+// the local optimisation window happened to land.
+struct Placement
+{
+	float					 protrusion{1.0F};
+	std::size_t				 inside_interior{0};
+	std::vector<std::size_t> fresh_nodes;
+};
+
+[[nodiscard]] Placement preview_placement(const DistanceField& field, const Primitive& prim,
+										  const std::vector<char>& covered)
+{
+	Placement	out;
+	std::size_t inside_total = 0;
+	std::size_t exterior	 = 0;
+	for (int ciz = 0; ciz < field.nz; ++ciz)
+	{
+		for (int ciy = 0; ciy < field.ny; ++ciy)
+		{
+			for (int cix = 0; cix < field.nx; ++cix)
+			{
+				const std::size_t node = field.linear_index(cix, ciy, ciz);
+				if (sd_primitive(field.node_position(cix, ciy, ciz), prim) > 0.0F)
+				{
+					continue;
+				}
+				++inside_total;
+				if (field.data.at(node) >= 0.0F)
+				{
+					++exterior;
+					continue;
+				}
+				++out.inside_interior;
+				if (covered.at(node) == 0)
+				{
+					out.fresh_nodes.push_back(node);
+				}
+			}
+		}
+	}
+	out.protrusion = (inside_total > 0) ? static_cast<float>(exterior) / static_cast<float>(inside_total) : 1.0F;
+	return out;
+}
+
+// Try every enabled primitive type at the seed; keep the inscribed fit that covers
+// the most fresh interior. Protrusion and coverage are scored on the grid, not the
+// local sample window, so an off-centre window can never pass a protruding fit.
+[[nodiscard]] std::optional<Fit> best_fit(const GridView& grid, const Seed& seed, const SeedFrame& frame,
+										  const FeatureExtent& feature, const Context& context,
+										  const SolverConfig& config, float scale)
+{
 	std::optional<Fit> best;
-	float			   best_fresh = 0.0F;
+	std::size_t		   best_fresh = 0;
 	for (const Kind kind : enabled_kinds(config))
 	{
-		const Fit	fit		   = optimize(kind, seed_params(kind, seed, frame), context, config, scale);
-		const float protrusion = (fit.obj.total > 0.0F) ? (fit.obj.total - fit.obj.interior) / fit.obj.total : 1.0F;
-		if (protrusion > config.max_protrusion)
+		const Fit		fit	  = optimize(kind, seed_params(kind, seed, frame, feature), context, config, scale);
+		const Placement place = preview_placement(*grid.field, fit.prim, *grid.covered);
+		if (place.protrusion > config.max_protrusion || place.inside_interior == 0)
 		{
 			continue;
 		}
-		if (fit.obj.fresh > best_fresh)
+		if (place.fresh_nodes.size() > best_fresh)
 		{
-			best_fresh = fit.obj.fresh;
+			best_fresh = place.fresh_nodes.size();
 			best	   = fit;
 		}
 	}
-	const float min_fresh = config.min_fresh_fraction * static_cast<float>(context.samples->size());
+	const auto min_fresh =
+		static_cast<std::size_t>(config.min_fresh_fraction * static_cast<float>(grid.total_interior));
 	if (best_fresh < min_fresh)
 	{
 		return std::nullopt;
@@ -863,50 +1042,6 @@ struct SolidFrame
 	return make_primitive(out);
 }
 
-// Read-only preview of placing `prim`: its protrusion and the interior grid nodes
-// it would newly cover.
-struct Placement
-{
-	float					 protrusion{1.0F};
-	std::size_t				 inside_interior{0};
-	std::vector<std::size_t> fresh_nodes;
-};
-
-[[nodiscard]] Placement preview_placement(const DistanceField& field, const Primitive& prim,
-										  const std::vector<char>& covered)
-{
-	Placement	out;
-	std::size_t inside_total = 0;
-	std::size_t exterior	 = 0;
-	for (int ciz = 0; ciz < field.nz; ++ciz)
-	{
-		for (int ciy = 0; ciy < field.ny; ++ciy)
-		{
-			for (int cix = 0; cix < field.nx; ++cix)
-			{
-				const std::size_t node = field.linear_index(cix, ciy, ciz);
-				if (sd_primitive(field.node_position(cix, ciy, ciz), prim) > 0.0F)
-				{
-					continue;
-				}
-				++inside_total;
-				if (field.data.at(node) >= 0.0F)
-				{
-					++exterior;
-					continue;
-				}
-				++out.inside_interior;
-				if (covered.at(node) == 0)
-				{
-					out.fresh_nodes.push_back(node);
-				}
-			}
-		}
-	}
-	out.protrusion = (inside_total > 0) ? static_cast<float>(exterior) / static_cast<float>(inside_total) : 1.0F;
-	return out;
-}
-
 // Place the symmetric copies of `prim` that land in fresh, inscribed territory,
 // returning the interior added. Each replica is validated independently, so an
 // approximate symmetry can never force a protruding or redundant primitive.
@@ -983,16 +1118,21 @@ std::vector<Primitive> decompose(const TriMesh& mesh, const SolverConfig& config
 		{
 			break;
 		}
-		// The seed clearance is the local length scale: it drives the sample box,
-		// the occupancy softness, and the optimizer step sizes.
-		const float					   scale   = seed.clearance;
-		const std::vector<SamplePoint> samples = local_samples(field, seed, config, rng);
-		const std::vector<float>	   weight  = compute_weights(samples, result);
-		const Context				   context = {.samples = &samples,
+		// The seed clearance is the local length scale: it drives the occupancy
+		// softness and the optimizer step sizes (the window reach is separate).
+		const float scale = seed.clearance;
+		// Probe an isotropic window for the local shape frame, then draw the
+		// optimisation samples from a window oriented + stretched along it.
+		const std::vector<SamplePoint> probe   = local_samples(field, seed, config, rng);
+		const SeedFrame				   frame   = seed_frame(probe, seed);
+		const LocalWindow			   window  = centered_window(field, seed, frame, config, rng);
+		const std::vector<float>	   weight  = compute_weights(window.samples, result);
+		const Context				   context = {.samples = &window.samples,
 												  .weight  = &weight,
 												  .tau	   = config.occupancy_tau * scale,
 												  .lambda  = config.protrusion_weight};
-		const std::optional<Fit>	   best	   = best_fit(seed, context, config, scale);
+		const GridView				   grid = {.field = &field, .covered = &covered, .total_interior = total_interior};
+		const std::optional<Fit>	   best = best_fit(grid, seed, frame, window.feature, context, config, scale);
 		if (!best.has_value())
 		{
 			break;

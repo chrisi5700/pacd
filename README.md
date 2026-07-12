@@ -73,9 +73,16 @@ objective (the "balloon"). With soft occupancy `o(d) = σ(−d/τ)`, the primiti
 rewarded for the *fresh* interior it captures — the intersection
 `max(d_prim, d_mesh)` of the primitive with the uncovered mesh interior — and
 penalised (weight λ) for any volume that protrudes outside the mesh, which
-enforces inscription. The integral is estimated by Monte-Carlo sampling **locally
-around the seed**, scaled to the local clearance so the objective is
-size-invariant across parts. The objective is differentiable in closed form, so
+enforces inscription. The integral is estimated by Monte-Carlo sampling in a
+window **oriented and stretched to the feature**: the seed's principal axes set
+its orientation, and it reaches along elongated axes so the objective can *see* —
+and therefore grow into — a long feature instead of stalling inside a
+clearance-sized cube (a bar would otherwise fragment into short pieces). The
+primitive is then **initialised to the feature extent measured from that window**,
+so descent only has to polish rather than crawl across the whole length. Candidate
+selection and the inscription gate are scored on the **grid** (the true field),
+not the local window, so an off-centre window can never pass a protruding fit. The
+objective is differentiable in closed form, so
 gradients are **analytic** — one pass over the samples rather than a central
 finite difference per parameter — and the rotation is updated in its **`so(3)`**
 tangent space (`R ← R·exp[θ]`) instead of nudging quaternion components and
