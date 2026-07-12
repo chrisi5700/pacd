@@ -73,6 +73,16 @@ struct SolverConfig
 	// so an approximate symmetry never forces a protruding or redundant primitive.
 	bool use_symmetry{true};
 
+	// After placement, greedily replace adjacent primitive pairs with a single
+	// re-fitted primitive (a few gradient-descent steps to inscribe the joint
+	// region). A merge is accepted only if one primitive re-covers at least
+	// `merge_retain` of the pair's interior (counting what surviving primitives
+	// still hold) without protruding, so it trades primitive count for a bounded
+	// coverage give-back. Raise `merge_retain` toward 1 for near-lossless (fewer,
+	// cleaner merges); lower it for a more parsimonious, slightly looser proxy.
+	bool  merge_primitives{true};
+	float merge_retain{0.97F};
+
 	// Optional progress hooks (empty by default), for long-running decompositions.
 	// `on_field_built` fires once after the mesh SDF grid is built; `on_primitive`
 	// fires after each primitive is placed, with the running count.

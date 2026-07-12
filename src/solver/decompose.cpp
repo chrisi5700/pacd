@@ -508,7 +508,161 @@ struct SeedFrame
 	return prm;
 }
 
-// How far the local sample box extends, as a multiple of the seed clearance.
+// ---- Bounded directional growth ------------------------------------------
+// For clearly elongated regions we let a primitive grow along the feature by
+// building a sample window that hugs the interior corridor instead of an
+// isotropic clearance-sized box. The corridor half-extents come from ray-marching
+// the SDF out from the seed along the local principal axes: each march halts at
+// the first interior->exterior crossing, so the window follows the feature and
+// can never leap across a gap into a neighbouring one. The primitive is then
+// initialised to (a shrink of) that corridor, so gradient descent polishes a
+// full-length fit rather than having to discover the length within its step
+// budget. Blocky/isotropic regions keep the proven isotropic path.
+
+constexpr float MARCH_CAP		= 12.0F; // corridor length cap, in seed clearances
+constexpr float MARCH_STEP_FRAC = 0.35F; // march step, in seed clearances
+constexpr float WINDOW_SHELL	= 1.2F;	 // exterior shell beyond each wall, in clearances
+constexpr float CORRIDOR_FILL	= 0.9F;	 // fraction of the corridor used to size the init
+constexpr float PINCH_FRAC		= 0.5F;	 // growth halts where clearance necks below this * seed clearance
+
+// Interior corridor length from `origin` along unit `dir`: the distance until the
+// inscribed clearance (-sdf) first drops to `floor`, capped at `max_dist`. With
+// floor 0 this halts at the surface (walls and gaps alike, so it never spans a
+// gap into an adjacent feature); with a positive floor it also halts at a "pinch"
+// -- a neck narrower than the floor -- which keeps a grown primitive from pushing
+// a constant cross-section through a bulging feature (e.g. a chain of spheres).
+[[nodiscard]] float march_interior(const DistanceField& field, Vec3 origin, Vec3 dir, float max_dist, float step,
+								   float floor)
+{
+	float dist = 0.0F;
+	while (dist + step <= max_dist)
+	{
+		const float next = dist + step;
+		if (field.sample(origin + (dir * next)) >= -floor)
+		{
+			break;
+		}
+		dist = next;
+	}
+	return dist;
+}
+
+// Oriented, seed-anchored sampling window with per-axis interior half-extents in
+// both directions (ext_pos along +axis, ext_neg along -axis). `elongated` is
+// false for isotropic regions, where callers keep the plain isotropic path.
+struct Window
+{
+	std::array<Vec3, 3>	 axis{vec3(1.0F, 0.0F, 0.0F), vec3(0.0F, 1.0F, 0.0F), vec3(0.0F, 0.0F, 1.0F)};
+	std::array<float, 3> ext_pos{};
+	std::array<float, 3> ext_neg{};
+	bool				 elongated{false};
+};
+
+// Interior corridor in both directions along one axis.
+struct Span
+{
+	float neg{0.0F};
+	float pos{0.0F};
+	[[nodiscard]] float len() const { return neg + pos; }
+};
+
+[[nodiscard]] Span march_span(const DistanceField& field, const Seed& seed, Vec3 axis, float step, float max_dist,
+							  float floor)
+{
+	return {.neg = march_interior(field, seed.pos, -axis, max_dist, step, floor),
+			.pos = march_interior(field, seed.pos, axis, max_dist, step, floor)};
+}
+
+[[nodiscard]] Window build_window(const DistanceField& field, const Seed& seed, const SeedFrame& frame)
+{
+	Window win;
+	win.axis	  = frame.axis;
+	win.elongated = frame.anisotropic;
+	if (!frame.anisotropic)
+	{
+		return win;
+	}
+	const float step	 = MARCH_STEP_FRAC * seed.clearance;
+	const float max_dist = MARCH_CAP * seed.clearance;
+
+	// Interior corridor length along each PCA axis. PCA orders its axes by local
+	// variance, which badly under-estimates length for a long thin feature (the
+	// isotropic probe barely sees the length), so we pick the growth axis from the
+	// marches -- the longest corridor -- rather than trusting the PCA order.
+	std::array<Span, 3> span;
+	for (std::size_t dim = 0; dim < 3; ++dim)
+	{
+		span.at(dim) = march_span(field, seed, frame.axis.at(dim), step, max_dist, 0.0F);
+	}
+	std::size_t grow = 0;
+	for (std::size_t dim = 1; dim < 3; ++dim)
+	{
+		if (span.at(dim).len() > span.at(grow).len())
+		{
+			grow = dim;
+		}
+	}
+
+	// Re-march the growth axis with the pinch floor so it halts at a neck (not just
+	// a wall), and place it first: the corridor-filling seed builds the primitive's
+	// long axis along it, and the minor axes keep their full-width (floor-0) spans.
+	const Span grown = march_span(field, seed, frame.axis.at(grow), step, max_dist, PINCH_FRAC * seed.clearance);
+	for (std::size_t slot = 0; slot < 3; ++slot)
+	{
+		const std::size_t src = (grow + slot) % 3;
+		const Span		  use = (slot == 0) ? grown : span.at(src);
+		win.axis.at(slot)	 = frame.axis.at(src);
+		win.ext_neg.at(slot) = use.neg;
+		win.ext_pos.at(slot) = use.pos;
+	}
+	return win;
+}
+
+// Corridor half-length and centre offset (both measured along axis `a`).
+struct Corridor
+{
+	float half{0.0F};
+	float offset{0.0F};
+};
+
+[[nodiscard]] Corridor corridor(const Window& win, std::size_t dim)
+{
+	return {.half = 0.5F * (win.ext_pos.at(dim) + win.ext_neg.at(dim)),
+			.offset = 0.5F * (win.ext_pos.at(dim) - win.ext_neg.at(dim))};
+}
+
+// Corridor-filling initial parameters for an elongated region: position and size
+// the primitive to (a shrink of) the marched interior corridor so descent starts
+// near a full-length fit. Falls back to the isotropic seeding otherwise, and a
+// sphere always keeps its inscribed-ball home (it ignores the corridor shape).
+[[nodiscard]] FitParams seed_params_windowed(Kind kind, const Seed& seed, const SeedFrame& frame, const Window& win)
+{
+	if (!win.elongated || kind == Kind::SPHERE)
+	{
+		return seed_params(kind, seed, frame);
+	}
+	const Corridor cor0	  = corridor(win, 0);
+	const Corridor cor1	  = corridor(win, 1);
+	const Corridor cor2	  = corridor(win, 2);
+	const Vec3	   center = seed.pos + (win.axis.at(0) * cor0.offset) + (win.axis.at(1) * cor1.offset) +
+						 (win.axis.at(2) * cor2.offset);
+
+	if (kind == Kind::BOX)
+	{
+		const Vec3 size = vec3(2.0F * cor0.half, 2.0F * cor1.half, 2.0F * cor2.half) * CORRIDOR_FILL;
+		return {.pos = center, .dims = size, .rot = quat_from_basis(win.axis.at(0), win.axis.at(1), win.axis.at(2))};
+	}
+
+	// Cylinder: long axis (local +Y) along the dominant corridor; radius from the
+	// tighter of the two minor corridors so the round section stays inscribed.
+	const float radius = 0.9F * std::min(cor1.half, cor2.half);
+	const float height = 2.0F * cor0.half * CORRIDOR_FILL;
+	const Quat	rot =
+		quat_from_basis(win.axis.at(1), win.axis.at(0), normalize(cross(win.axis.at(1), win.axis.at(0))));
+	return {.pos = center, .dims = vec3(radius, height, 0.0F), .rot = rot};
+}
+
+// How far the isotropic sample box extends, as a multiple of the seed clearance.
 // Big enough to contain the growing primitive plus a protrusion shell (the mesh
 // surface sits at ~1x clearance), small enough that the interior is well sampled
 // even for thin parts whose interior is a tiny fraction of the whole bbox.
@@ -527,6 +681,30 @@ constexpr float SAMPLE_SPAN = 2.5F;
 	for (int idx = 0; idx < config.sample_count; ++idx)
 	{
 		const Vec3 pos = seed.pos + vec3(jitter(rng), jitter(rng), jitter(rng));
+		samples.push_back({.pos = pos, .mesh_sdf = field.sample(pos)});
+	}
+	return samples;
+}
+
+// Monte-Carlo points in the oriented corridor window, plus an exterior shell so
+// the protrusion term still sees outside-the-mesh volume beyond each wall. Used
+// in place of local_samples for elongated regions.
+[[nodiscard]] std::vector<SamplePoint> oriented_samples(const DistanceField& field, const Seed& seed,
+														const Window& win, const SolverConfig& config, std::mt19937& rng)
+{
+	const float							  shell = WINDOW_SHELL * seed.clearance;
+	std::uniform_real_distribution<float> unit(0.0F, 1.0F);
+	std::vector<SamplePoint>			  samples;
+	samples.reserve(static_cast<std::size_t>(std::max(config.sample_count, 0)));
+	for (int idx = 0; idx < config.sample_count; ++idx)
+	{
+		Vec3 pos = seed.pos;
+		for (std::size_t dim = 0; dim < 3; ++dim)
+		{
+			const float low	 = -(win.ext_neg.at(dim) + shell);
+			const float high = win.ext_pos.at(dim) + shell;
+			pos				 = pos + (win.axis.at(dim) * (low + (unit(rng) * (high - low))));
+		}
 		samples.push_back({.pos = pos, .mesh_sdf = field.sample(pos)});
 	}
 	return samples;
@@ -599,15 +777,16 @@ constexpr float SAMPLE_SPAN = 2.5F;
 }
 
 // Try every enabled primitive type at the seed; keep the best inscribed fit.
-[[nodiscard]] std::optional<Fit> best_fit(const Seed& seed, const Context& context, const SolverConfig& config,
-										  float scale)
+// The window supplies corridor-filling initial parameters for elongated regions
+// (isotropic regions leave it disabled and fall back to PCA-warm-started seeds).
+[[nodiscard]] std::optional<Fit> best_fit(const Seed& seed, const SeedFrame& frame, const Window& window,
+										  const Context& context, const SolverConfig& config, float scale)
 {
-	const SeedFrame	   frame = seed_frame(*context.samples, seed);
 	std::optional<Fit> best;
 	float			   best_fresh = 0.0F;
 	for (const Kind kind : enabled_kinds(config))
 	{
-		const Fit	fit		   = optimize(kind, seed_params(kind, seed, frame), context, config, scale);
+		const Fit	fit		   = optimize(kind, seed_params_windowed(kind, seed, frame, window), context, config, scale);
 		const float protrusion = (fit.obj.total > 0.0F) ? (fit.obj.total - fit.obj.interior) / fit.obj.total : 1.0F;
 		if (protrusion > config.max_protrusion)
 		{
@@ -947,6 +1126,343 @@ struct Placement
 	return added_total;
 }
 
+// Mark the interior grid nodes within the seed's inscribed ball as blocked, so an
+// un-fittable pocket (one where every candidate is redundant or protrudes) is
+// skipped by future seeding rather than halting the whole decomposition or being
+// re-seeded forever. Blocked nodes read as covered to find_seed/preview without
+// counting toward filled coverage.
+void block_seed(const DistanceField& field, const Seed& seed, std::vector<char>& covered)
+{
+	const float radius = seed.clearance;
+	for (int ciz = 0; ciz < field.nz; ++ciz)
+	{
+		for (int ciy = 0; ciy < field.ny; ++ciy)
+		{
+			for (int cix = 0; cix < field.nx; ++cix)
+			{
+				const std::size_t node = field.linear_index(cix, ciy, ciz);
+				if (covered.at(node) != 0 || field.data.at(node) >= 0.0F)
+				{
+					continue;
+				}
+				if (length(field.node_position(cix, ciy, ciz) - seed.pos) <= radius)
+				{
+					covered.at(node) = 1;
+				}
+			}
+		}
+	}
+}
+
+// ---- Merge pass ----------------------------------------------------------
+// Greedily replace an adjacent primitive pair with one re-fitted primitive. A
+// merge is kept only when a single primitive re-covers nearly all of the pair's
+// interior with no more than the allowed protrusion, so the count can only fall
+// -- coverage and inscription are never traded away. The re-fit warm-starts from
+// the joint region's oriented bounding frame and runs the normal inner loop, so
+// a slightly misaligned pair is polished into a proper single fit.
+
+constexpr float		  MERGE_NEAR_SCALE = 1.15F; // only pairs whose bounding spheres are within this factor
+constexpr std::size_t MERGE_MIN_REGION = 8;		// ignore trivially small joint regions
+
+[[nodiscard]] float bounding_radius(const Primitive& prim)
+{
+	if (std::holds_alternative<Sphere>(prim))
+	{
+		return std::get<Sphere>(prim).radius;
+	}
+	if (std::holds_alternative<Box>(prim))
+	{
+		return 0.5F * length(std::get<Box>(prim).size);
+	}
+	const Cylinder cyl = std::get<Cylinder>(prim);
+	return std::sqrt((cyl.radius * cyl.radius) + (0.25F * cyl.height * cyl.height));
+}
+
+[[nodiscard]] bool bounds_near(const Primitive& lhs, const Primitive& rhs)
+{
+	const float reach = MERGE_NEAR_SCALE * (bounding_radius(lhs) + bounding_radius(rhs));
+	return length(lhs.get_pos() - rhs.get_pos()) <= reach;
+}
+
+[[nodiscard]] Vec3 node_position_of(const DistanceField& field, std::size_t node)
+{
+	const int cix = static_cast<int>(node % static_cast<std::size_t>(field.nx));
+	const int rem = static_cast<int>(node / static_cast<std::size_t>(field.nx));
+	return field.node_position(cix, rem % field.ny, rem / field.ny);
+}
+
+// Interior grid nodes inside each primitive (a node may be owned by several).
+[[nodiscard]] std::vector<std::vector<std::size_t>> owned_nodes(const DistanceField&		   field,
+															   const std::vector<Primitive>& prims)
+{
+	std::vector<std::vector<std::size_t>> owned(prims.size());
+	for (int ciz = 0; ciz < field.nz; ++ciz)
+	{
+		for (int ciy = 0; ciy < field.ny; ++ciy)
+		{
+			for (int cix = 0; cix < field.nx; ++cix)
+			{
+				const std::size_t node = field.linear_index(cix, ciy, ciz);
+				if (field.data.at(node) >= 0.0F)
+				{
+					continue;
+				}
+				const Vec3 pos = field.node_position(cix, ciy, ciz);
+				for (std::size_t idx = 0; idx < prims.size(); ++idx)
+				{
+					if (sd_primitive(pos, prims.at(idx)) <= 0.0F)
+					{
+						owned.at(idx).push_back(node);
+					}
+				}
+			}
+		}
+	}
+	return owned;
+}
+
+[[nodiscard]] std::vector<std::size_t> region_union(const std::vector<std::size_t>& lhs,
+													const std::vector<std::size_t>& rhs)
+{
+	std::vector<std::size_t> region;
+	region.reserve(lhs.size() + rhs.size());
+	region.insert(region.end(), lhs.begin(), lhs.end());
+	region.insert(region.end(), rhs.begin(), rhs.end());
+	std::ranges::sort(region);
+	const auto dup = std::ranges::unique(region);
+	region.erase(dup.begin(), dup.end());
+	return region;
+}
+
+[[nodiscard]] std::vector<Primitive> without_pair(const std::vector<Primitive>& prims, std::size_t lhs,
+												  std::size_t rhs)
+{
+	std::vector<Primitive> out;
+	out.reserve(prims.size());
+	for (std::size_t idx = 0; idx < prims.size(); ++idx)
+	{
+		if (idx != lhs && idx != rhs)
+		{
+			out.push_back(prims.at(idx));
+		}
+	}
+	return out;
+}
+
+// Oriented bounding frame of a node region, packaged as the seed/frame/window the
+// corridor-fill seeding and oriented sampling already expect: symmetric extents,
+// longest axis first so a cylinder aligns with the region's long axis.
+struct RegionFit
+{
+	Seed	  seed;
+	SeedFrame frame;
+	Window	  window;
+};
+
+[[nodiscard]] RegionFit region_fit(const DistanceField& field, const std::vector<std::size_t>& region)
+{
+	const Vec3 mean = std::transform_reduce(region.begin(), region.end(), Vec3{}, std::plus<>{},
+											[&field](std::size_t node) { return node_position_of(field, node); });
+	const Vec3 centroid = mean * (1.0F / static_cast<float>(region.size()));
+	SymMat3	   cov{};
+	for (const std::size_t node : region)
+	{
+		const Vec3 off = node_position_of(field, node) - centroid;
+		cov.xx += off.x * off.x;
+		cov.yy += off.y * off.y;
+		cov.zz += off.z * off.z;
+		cov.xy += off.x * off.y;
+		cov.xz += off.x * off.z;
+		cov.yz += off.y * off.z;
+	}
+	const SymEigen		 eigen = symmetric_eigen(cov);
+	std::array<float, 3> ext{};
+	for (const std::size_t node : region)
+	{
+		const Vec3 off = node_position_of(field, node) - centroid;
+		for (std::size_t dim = 0; dim < 3; ++dim)
+		{
+			ext.at(dim) = std::max(ext.at(dim), std::abs(dot(off, eigen.vectors.at(dim))));
+		}
+	}
+	std::array<std::size_t, 3> order{0, 1, 2};
+	std::ranges::sort(order, [&ext](std::size_t lhs, std::size_t rhs) { return ext.at(lhs) > ext.at(rhs); });
+
+	RegionFit	out;
+	const float min_cell = std::min({field.cell.x, field.cell.y, field.cell.z});
+	out.frame.axis.at(0)  = eigen.vectors.at(order.at(0));
+	out.frame.axis.at(1)  = eigen.vectors.at(order.at(1));
+	out.frame.axis.at(2)  = normalize(cross(out.frame.axis.at(0), out.frame.axis.at(1)));
+	out.frame.anisotropic = true;
+	out.window.axis		  = out.frame.axis;
+	out.window.elongated  = true;
+	for (std::size_t dim = 0; dim < 3; ++dim)
+	{
+		out.window.ext_pos.at(dim) = ext.at(order.at(dim));
+		out.window.ext_neg.at(dim) = ext.at(order.at(dim));
+	}
+	out.seed = {.found = true, .pos = centroid, .clearance = std::max(ext.at(order.at(2)), min_cell)};
+	return out;
+}
+
+// Best single-primitive fit over the merged region (try every kind, keep the one
+// that captures the most of it); no gate here -- acceptance is judged on the grid.
+[[nodiscard]] std::optional<Fit> merge_fit(const DistanceField& field, const RegionFit& region,
+										   const std::vector<Primitive>& others, const SolverConfig& config,
+										   std::mt19937& rng)
+{
+	const std::vector<SamplePoint> samples = oriented_samples(field, region.seed, region.window, config, rng);
+	const std::vector<float>	   weight  = compute_weights(samples, others);
+	const float					   scale   = region.seed.clearance;
+	const Context				   context = {.samples = &samples,
+											  .weight  = &weight,
+											  .tau	   = config.occupancy_tau * scale,
+											  .lambda  = config.protrusion_weight};
+	std::optional<Fit>			   best;
+	float						   best_fresh = 0.0F;
+	for (const Kind kind : enabled_kinds(config))
+	{
+		const Fit fit =
+			optimize(kind, seed_params_windowed(kind, region.seed, region.frame, region.window), context, config, scale);
+		if (fit.obj.fresh > best_fresh)
+		{
+			best_fresh = fit.obj.fresh;
+			best	   = fit;
+		}
+	}
+	return best;
+}
+
+struct MergeQuality
+{
+	float retain{0.0F};
+	float protrusion{1.0F};
+};
+
+// How well `prim` re-covers the joint region and how much it protrudes, both on
+// the grid (the ground truth, independent of the fit's local sampling). A region
+// node counts as retained if `prim` OR any surviving primitive (`others`) covers
+// it, so the retain figure is the true post-merge coverage of the region -- a
+// node another primitive still holds is never a loss, which keeps global coverage
+// from eroding as merges compound.
+[[nodiscard]] MergeQuality merge_quality(const DistanceField& field, const Primitive& prim,
+										 const std::vector<std::size_t>& region, const std::vector<Primitive>& others)
+{
+	std::size_t inside_total = 0;
+	std::size_t exterior	 = 0;
+	for (int ciz = 0; ciz < field.nz; ++ciz)
+	{
+		for (int ciy = 0; ciy < field.ny; ++ciy)
+		{
+			for (int cix = 0; cix < field.nx; ++cix)
+			{
+				if (sd_primitive(field.node_position(cix, ciy, ciz), prim) > 0.0F)
+				{
+					continue;
+				}
+				++inside_total;
+				exterior += (field.data.at(field.linear_index(cix, ciy, ciz)) >= 0.0F) ? 1 : 0;
+			}
+		}
+	}
+	const auto covered = static_cast<std::size_t>(std::ranges::count_if(
+		region,
+		[&field, &prim, &others](std::size_t node)
+		{
+			const Vec3 pos = node_position_of(field, node);
+			return sd_primitive(pos, prim) <= 0.0F ||
+				   std::ranges::any_of(others, [pos](const Primitive& other) { return sd_primitive(pos, other) <= 0.0F; });
+		}));
+	return {.retain = region.empty() ? 0.0F : static_cast<float>(covered) / static_cast<float>(region.size()),
+			.protrusion =
+				(inside_total > 0) ? static_cast<float>(exterior) / static_cast<float>(inside_total) : 1.0F};
+}
+
+struct MergeChoice
+{
+	std::size_t lhs{0};
+	std::size_t rhs{0};
+	Primitive	prim;
+	std::size_t region_size{0};
+	bool		found{false};
+};
+
+// Shared, read-only inputs for the pairwise search, bundled to keep signatures
+// small (pointers, since clang-tidy forbids reference data members).
+struct MergeInputs
+{
+	const DistanceField*						 field{nullptr};
+	const std::vector<Primitive>*				 result{nullptr};
+	const std::vector<std::vector<std::size_t>>* owned{nullptr};
+};
+
+// A merge for pair (lhs, rhs) if a single re-fit stays inscribed and re-covers at
+// least `merge_retain` of the pair's interior (counting nodes any surviving
+// primitive still holds), and the joint region is bigger than `min_region` (so
+// callers converge on the largest merge available this round).
+[[nodiscard]] std::optional<MergeChoice> evaluate_pair(const MergeInputs& inputs, std::size_t lhs, std::size_t rhs,
+													   const SolverConfig& config, std::mt19937& rng,
+													   std::size_t min_region)
+{
+	if (!bounds_near(inputs.result->at(lhs), inputs.result->at(rhs)))
+	{
+		return std::nullopt;
+	}
+	const std::vector<std::size_t> region = region_union(inputs.owned->at(lhs), inputs.owned->at(rhs));
+	if (region.size() < MERGE_MIN_REGION || region.size() <= min_region)
+	{
+		return std::nullopt;
+	}
+	const std::vector<Primitive> others = without_pair(*inputs.result, lhs, rhs);
+	const std::optional<Fit>	 cand  = merge_fit(*inputs.field, region_fit(*inputs.field, region), others, config, rng);
+	if (!cand)
+	{
+		return std::nullopt;
+	}
+	const MergeQuality quality = merge_quality(*inputs.field, cand->prim, region, others);
+	if (quality.retain < config.merge_retain || quality.protrusion > config.max_protrusion)
+	{
+		return std::nullopt;
+	}
+	return MergeChoice{.lhs = lhs, .rhs = rhs, .prim = cand->prim, .region_size = region.size(), .found = true};
+}
+
+[[nodiscard]] MergeChoice find_best_merge(const MergeInputs& inputs, const SolverConfig& config, std::mt19937& rng)
+{
+	MergeChoice best;
+	for (std::size_t i = 0; i < inputs.result->size(); ++i)
+	{
+		for (std::size_t j = i + 1; j < inputs.result->size(); ++j)
+		{
+			const std::optional<MergeChoice> choice = evaluate_pair(inputs, i, j, config, rng, best.region_size);
+			if (choice.has_value())
+			{
+				best = *choice;
+			}
+		}
+	}
+	return best;
+}
+
+void merge_pass(const DistanceField& field, const SolverConfig& config, std::mt19937& rng,
+				std::vector<Primitive>& result)
+{
+	while (result.size() > 1)
+	{
+		const std::vector<std::vector<std::size_t>> owned = owned_nodes(field, result);
+		const MergeInputs							inputs{.field = &field, .result = &result, .owned = &owned};
+		const MergeChoice							choice = find_best_merge(inputs, config, rng);
+		if (!choice.found)
+		{
+			break;
+		}
+		std::vector<Primitive> merged = without_pair(result, choice.lhs, choice.rhs);
+		merged.push_back(choice.prim);
+		result = std::move(merged);
+	}
+}
+
 } // namespace
 
 std::vector<Primitive> decompose(const TriMesh& mesh, const SolverConfig& config)
@@ -985,17 +1501,24 @@ std::vector<Primitive> decompose(const TriMesh& mesh, const SolverConfig& config
 		}
 		// The seed clearance is the local length scale: it drives the sample box,
 		// the occupancy softness, and the optimizer step sizes.
-		const float					   scale   = seed.clearance;
-		const std::vector<SamplePoint> samples = local_samples(field, seed, config, rng);
-		const std::vector<float>	   weight  = compute_weights(samples, result);
-		const Context				   context = {.samples = &samples,
-												  .weight  = &weight,
-												  .tau	   = config.occupancy_tau * scale,
-												  .lambda  = config.protrusion_weight};
-		const std::optional<Fit>	   best	   = best_fit(seed, context, config, scale);
+		const float					   scale = seed.clearance;
+		const std::vector<SamplePoint> probe = local_samples(field, seed, config, rng);
+		const SeedFrame				   frame = seed_frame(probe, seed);
+		const Window				   window = build_window(field, seed, frame);
+		const std::vector<SamplePoint> samples =
+			window.elongated ? oriented_samples(field, seed, window, config, rng) : probe;
+		const std::vector<float> weight	 = compute_weights(samples, result);
+		const Context			 context = {.samples = &samples,
+											.weight	 = &weight,
+											.tau	 = config.occupancy_tau * scale,
+											.lambda	 = config.protrusion_weight};
+		const std::optional<Fit> best	 = best_fit(seed, frame, window, context, config, scale);
 		if (!best.has_value())
 		{
-			break;
+			// Skip this pocket instead of ending the whole decomposition: block its
+			// inscribed ball so seeding advances to the next uncovered region.
+			block_seed(field, seed, covered);
+			continue;
 		}
 		result.push_back(best->prim);
 		if (config.on_primitive)
@@ -1009,6 +1532,13 @@ std::vector<Primitive> decompose(const TriMesh& mesh, const SolverConfig& config
 		{
 			break;
 		}
+	}
+
+	// Consolidation: fold adjacent primitives into single re-fitted ones where a
+	// lone primitive covers the pair just as well, trimming the count.
+	if (config.merge_primitives)
+	{
+		merge_pass(field, config, rng, result);
 	}
 	return result;
 }

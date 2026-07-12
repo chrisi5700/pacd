@@ -296,7 +296,7 @@ struct PanelRequest
 void budget_controls(solver::SolverConfig& config)
 {
 	ImGui::SeparatorText("Budget");
-	ImGui::SliderInt("max primitives", &config.max_primitives, 1, 64);
+	ImGui::SliderInt("max primitives", &config.max_primitives, 1, 128);
 	ImGui::SliderFloat("target coverage", &config.target_coverage, 0.0F, 1.0F);
 	ImGui::Checkbox("sphere", &config.use_sphere);
 	ImGui::SameLine();
@@ -304,6 +304,11 @@ void budget_controls(solver::SolverConfig& config)
 	ImGui::SameLine();
 	ImGui::Checkbox("cylinder", &config.use_cylinder);
 	ImGui::Checkbox("symmetry (replicate fits across detected symmetry)", &config.use_symmetry);
+	ImGui::Checkbox("merge (consolidate adjacent primitives)", &config.merge_primitives);
+	if (config.merge_primitives)
+	{
+		ImGui::SliderFloat("merge retain", &config.merge_retain, 0.80F, 1.0F, "%.2f");
+	}
 }
 
 void quality_controls(solver::SolverConfig& config)

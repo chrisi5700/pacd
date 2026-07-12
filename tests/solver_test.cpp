@@ -198,6 +198,22 @@ namespace
 	return std::get<Cylinder>(prim).pos;
 }
 
+// World-space extent of a fitted primitive along its longest axis: a cylinder's
+// height, a box's widest side, a sphere's diameter.
+[[nodiscard]] float primitive_long_extent(const Primitive& prim)
+{
+	if (std::holds_alternative<Cylinder>(prim))
+	{
+		return std::get<Cylinder>(prim).height;
+	}
+	if (std::holds_alternative<Box>(prim))
+	{
+		const Vec3 size = std::get<Box>(prim).size;
+		return std::max({size.x, size.y, size.z});
+	}
+	return 2.0F * std::get<Sphere>(prim).radius;
+}
+
 // A scalar summary of a primitive's dimensions -- identical for exact replicas.
 [[nodiscard]] float primitive_size_signature(const Primitive& prim)
 {
@@ -256,6 +272,60 @@ TEST_CASE("decompose orients a primitive along an oblique beam", "[decompose]")
 	const Vec3 fit_axis	 = primitive_long_axis(parts.front());
 	// Aligned within ~15 deg (|cos| > ~0.87); an axis-aligned fit would score ~0.71.
 	REQUIRE(std::abs(dot(beam_axis, fit_axis)) > 0.87F);
+}
+
+TEST_CASE("decompose grows one primitive along an elongated beam", "[decompose]")
+{
+	// A long, thin axis-aligned beam (length 6, cross-section 1.2). Bounded growth
+	// marches the interior corridor along the beam and initialises the primitive to
+	// it, so the first (deepest-seed) primitive should span most of the length in one
+	// shot rather than fragmenting the beam into many short pieces.
+	const TriMesh beam = test::make_beam_mesh(vec3(3.0F, 0.6F, 0.6F), Quat{});
+
+	SolverConfig config	  = fast_config();
+	config.sdf_resolution = 28;
+	config.sample_count	  = 1500;
+	config.gd_iterations  = 80;
+	config.max_primitives = 1; // force the whole budget onto a single primitive
+
+	const std::vector<Primitive> parts = decompose(beam, config);
+	REQUIRE(!parts.empty());
+	REQUIRE_FALSE(std::holds_alternative<Sphere>(parts.front())); // a sphere cannot grow long
+
+	// The lone primitive should cover well over half of the 6-unit length and lie
+	// along the beam (world +X): without bounded growth it stalls near ~1 unit.
+	REQUIRE(primitive_long_extent(parts.front()) > 4.0F);
+	REQUIRE(std::abs(primitive_long_axis(parts.front()).x) > 0.9F);
+}
+
+TEST_CASE("merging never increases the count and preserves coverage", "[decompose]")
+{
+	// Two disjoint cubes: greedy needs at least one primitive per lobe, and a merge
+	// across the empty gap would protrude, so it is rejected. The merge pass must
+	// therefore never raise the count and must keep both lobes covered -- it can
+	// only ever remove redundant primitives, never trade away coverage.
+	const float	  offset = 1.4F;
+	const TriMesh mesh	 = test::make_two_box_mesh(0.8F, offset);
+
+	SolverConfig base	  = fast_config();
+	base.sdf_resolution	  = 28;
+	base.use_symmetry	  = false; // isolate the merge behaviour from replication
+
+	SolverConfig no_merge	= base;
+	no_merge.merge_primitives = false;
+	SolverConfig with_merge		= base;
+	with_merge.merge_primitives = true;
+
+	const std::vector<Primitive> unmerged = decompose(mesh, no_merge);
+	const std::vector<Primitive> merged	  = decompose(mesh, with_merge);
+
+	REQUIRE(merged.size() >= 2);				// at least one primitive per disjoint lobe
+	REQUIRE(merged.size() <= unmerged.size());	// merging only ever removes primitives
+	for (const float shift : {offset, -offset}) // both lobes stay covered after merging
+	{
+		const Vec3 lobe = vec3(shift, 0.0F, 0.0F);
+		REQUIRE(std::ranges::any_of(merged, [lobe](const Primitive& prim) { return sd_primitive(lobe, prim) <= 0.0F; }));
+	}
 }
 
 TEST_CASE("decompose replicates primitives across a mirror symmetry", "[decompose]")

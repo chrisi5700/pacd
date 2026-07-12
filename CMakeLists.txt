@@ -91,5 +91,6 @@ target_compile_features(pacd_solver PUBLIC cxx_std_23)
 add_subdirectory(playground)
 add_subdirectory(bench)
 add_subdirectory(tests)
+add_subdirectory(tools)
 
 # add_subdirectory(libs/SFML) # for example to add other cmake dependencies

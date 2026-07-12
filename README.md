@@ -52,6 +52,23 @@ the mesh surface).
   one that captures the most new interior volume. Fully skipping ill-suited types
   (heuristic dispatch) is a later optimisation.
 
+- **Bounded directional growth.** Elongated features (a bar, a screw shaft, a
+  jenga block, a table top) fill best with one large primitive, but an isotropic
+  clearance-sized sample window can only reward growth out to a couple of
+  clearances — so they used to fragment into short pieces with gaps. Instead the
+  window is **marched** out from the seed along the local principal axes: each
+  march follows the interior until it hits a wall, a gap, or a **neck** (a point
+  where the inscribed clearance necks below a fraction of the seed's), so it hugs
+  the feature and never leaps across empty space into a neighbour. The longest
+  corridor is taken as the growth axis — a far better length estimate than the
+  local PCA variance, which barely sees the length — and the primitive is
+  initialised to fill that corridor, so descent *polishes* a full-length fit
+  rather than having to *discover* the length within its step budget. The
+  neck-stop keeps a constant cross-section from being driven through a bulging
+  feature: a chain of spheres stays spheres, not one lumpy cylinder. A seed where
+  nothing inscribes cleanly is skipped (its pocket blocked) rather than ending the
+  whole run, so one hard spot never strands the remaining budget.
+
 - **Symmetry-aware replication.** The shape's global symmetry is detected up front
   from the SDF — a transform `T` is a symmetry iff the field is invariant under it
   (`d(x) ≈ d(Tx)`), so candidate mirrors and n-fold rotations about the principal
@@ -61,6 +78,19 @@ the mesh surface).
   coverage gates), so an approximate symmetry can never force a protruding or
   redundant primitive — it only ever saves work. On symmetric parts this is 2–4×
   faster and yields a more consistent decomposition.
+
+- **Merge / consolidate.** Greedy placement leaves a crowd of small stitch
+  primitives around the few big ones (the diminishing tail). A final pass folds
+  adjacent pairs back together: it re-fits **one** primitive to the pair's joint
+  interior (warm-started from the region's oriented bounding frame, then the same
+  gradient-descent inner loop, so a slightly misaligned pair is polished into a
+  proper single fit) and keeps the merge only if that lone primitive re-covers at
+  least `merge_retain` of the pair — counting interior any *surviving* primitive
+  still holds, so a merge can never open a hole another primitive already fills.
+  Applied greedily (largest region first, repeated to a fixpoint), it collapses a
+  whole cluster and trades primitive count for a bounded, tunable coverage
+  give-back — on the composite corpus this roughly halves the primitive count at
+  a fraction of a percent of mean IoU.
 
 - **Termination.** Stop at *x %* of the interior filled **or** *n* primitives,
   whichever trips first. The tail (concave corners, thin features) is expensive
@@ -116,12 +146,14 @@ the harness around it.
   inscribed inner-loop optimiser (Adam over **analytic** gradients with an
   **`so(3)`** rotation update and convergence early-stop, on local Monte-Carlo
   samples), PCA-warm-started seeding (the seed's local principal axes
-  orient and pre-size each candidate), SDF-based symmetry detection with
-  orbit replication of each fit, and the greedy driver
-  `decompose(mesh, config)`. Builds clean under the strict `llm-vcpkg` preset and
-  is verified end-to-end (synthetic cube → one oriented box; an oblique beam → an
-  orientation-aligned fit; a mirror-symmetric pair → exactly replicated fits; a
-  real Thingi10K part → an inscribed primitive set).
+  orient and pre-size each candidate), **bounded directional growth** that marches
+  the interior corridor so one primitive fills a whole elongated feature (halting
+  at walls, gaps and necks), SDF-based symmetry detection with orbit replication
+  of each fit, and the greedy driver `decompose(mesh, config)`. Builds clean under
+  the strict `llm-vcpkg` preset and is verified end-to-end (synthetic cube → one
+  oriented box; an oblique beam → an orientation-aligned fit; an elongated beam →
+  one grown full-length primitive; a mirror-symmetric pair → exactly replicated
+  fits; a real Thingi10K part → an inscribed primitive set).
 - **Viewer (`pacd-viewer`):** decomposes each STL and overlays the fitted
   primitives (solid, colour-coded) on the original mesh (a wireframe cage);
   arrow keys cycle files, `T` toggles the cage, and progress is logged. A **Dear
@@ -131,7 +163,10 @@ the harness around it.
 - **Harness:** a `std::expected` STL loader (ASCII + binary), dependency-free
   math, the **100-mesh Thingi10K corpus** (see
   [`resources/README.md`](resources/README.md)), and `render_bridge.hpp`
-  (`render::Mesh` → solver `TriMesh`).
+  (`render::Mesh` → solver `TriMesh`). `tools/score-composites` decomposes a
+  directory of composite fixtures and reports per-mesh coverage / spill / IoU
+  against the mesh (and the intended part count from the JSON sidecars), so a
+  change to the fitter can be judged on real multi-part shapes rather than by eye.
 - **Next:** BVH acceleration for the mesh SDF (the brute-force grid build now
   dominates the wall-clock), partial/local symmetry (segment first, then detect
   per-region), and running decomposition off the UI thread so the window stays
@@ -179,6 +214,7 @@ Configure presets: `dev-vcpkg`, `llm-vcpkg`, `release-vcpkg` (plus
 | `src/viewer_main.cpp`   | `pacd-viewer` CLI front-end                                  |
 | `resources/`            | Thingi10K test corpus + selection/download tooling          |
 | `tests/`                | Catch2 unit tests                                            |
+| `tools/`                | Measurement CLIs (`score-composites` fitter-quality harness) |
 | `bench/`                | Google Benchmark microbenchmarks                             |
 | `playground/`           | Throwaway prototyping                                        |
 | `cmake/`                | Target helpers, compiler settings, tooling                  |
