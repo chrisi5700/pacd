@@ -46,6 +46,16 @@ struct DistanceField
 							 static_cast<float>(ciz) * cell.z);
 	}
 
+	// World position of the node at a flat index (cix fastest, then ciy, then ciz):
+	// the inverse of linear_index.
+	[[nodiscard]] Vec3 node_position(std::size_t linear) const noexcept
+	{
+		const auto width = static_cast<std::size_t>(nx);
+		const auto slice = width * static_cast<std::size_t>(ny);
+		return node_position(static_cast<int>(linear % width), static_cast<int>((linear % slice) / width),
+							 static_cast<int>(linear / slice));
+	}
+
 	[[nodiscard]] float at_index(int cix, int ciy, int ciz) const { return data.at(linear_index(cix, ciy, ciz)); }
 
 	// Trilinearly interpolated signed distance at an arbitrary world point.

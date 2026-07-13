@@ -7,13 +7,15 @@
 // clang-tidy. Matrices are column-major (OpenGL convention) so the same code
 // could later back an OpenGL viewer without transposing.
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <numbers>
 
 namespace pacd::render {
 
-inline constexpr float PI_F = 3.14159265358979323846F;
+inline constexpr float PI_F = std::numbers::pi_v<float>;
 
 [[nodiscard]] constexpr float radians(float degrees) noexcept {
     return degrees * (PI_F / 180.0F);
@@ -45,6 +47,12 @@ struct Vec3 {
 }
 [[nodiscard]] constexpr Vec3 hadamard(Vec3 lhs, Vec3 rhs) noexcept {
     return {lhs.x * rhs.x, lhs.y * rhs.y, lhs.z * rhs.z};
+}
+[[nodiscard]] constexpr Vec3 min(Vec3 lhs, Vec3 rhs) noexcept {
+    return {std::min(lhs.x, rhs.x), std::min(lhs.y, rhs.y), std::min(lhs.z, rhs.z)};
+}
+[[nodiscard]] constexpr Vec3 max(Vec3 lhs, Vec3 rhs) noexcept {
+    return {std::max(lhs.x, rhs.x), std::max(lhs.y, rhs.y), std::max(lhs.z, rhs.z)};
 }
 
 [[nodiscard]] constexpr float dot(Vec3 lhs, Vec3 rhs) noexcept {

@@ -1019,8 +1019,8 @@ struct SolidFrame
 		return make_primitive(out);
 	}
 	const bool is_box = std::holds_alternative<Box>(prim);
-	const Quat rot	  = is_box ? std::get<Box>(prim).rot : std::get<Cylinder>(prim).rot;
-	const Vec3 pos	  = is_box ? std::get<Box>(prim).pos : std::get<Cylinder>(prim).pos;
+	const Quat rot	  = prim.rotation();
+	const Vec3 pos	  = prim.center();
 
 	Vec3 col_x = linear_map(iso, rotate(rot, vec3(1.0F, 0.0F, 0.0F)));
 	Vec3 col_y = linear_map(iso, rotate(rot, vec3(0.0F, 1.0F, 0.0F)));
@@ -1167,31 +1167,10 @@ constexpr float		  MERGE_NEAR_SCALE = 1.15F; // only pairs whose bounding sphere
 constexpr std::size_t MERGE_MIN_REGION = 8;		// ignore trivially small joint regions
 constexpr std::size_t MERGE_FEATURE_MIN = 48;	// below this a member is aliasing debris, not a feature to protect
 
-[[nodiscard]] float bounding_radius(const Primitive& prim)
-{
-	if (std::holds_alternative<Sphere>(prim))
-	{
-		return std::get<Sphere>(prim).radius;
-	}
-	if (std::holds_alternative<Box>(prim))
-	{
-		return 0.5F * length(std::get<Box>(prim).size);
-	}
-	const Cylinder cyl = std::get<Cylinder>(prim);
-	return std::sqrt((cyl.radius * cyl.radius) + (0.25F * cyl.height * cyl.height));
-}
-
 [[nodiscard]] bool bounds_near(const Primitive& lhs, const Primitive& rhs)
 {
-	const float reach = MERGE_NEAR_SCALE * (bounding_radius(lhs) + bounding_radius(rhs));
-	return length(lhs.get_pos() - rhs.get_pos()) <= reach;
-}
-
-[[nodiscard]] Vec3 node_position_of(const DistanceField& field, std::size_t node)
-{
-	const int cix = static_cast<int>(node % static_cast<std::size_t>(field.nx));
-	const int rem = static_cast<int>(node / static_cast<std::size_t>(field.nx));
-	return field.node_position(cix, rem % field.ny, rem / field.ny);
+	const float reach = MERGE_NEAR_SCALE * (lhs.bounding_radius() + rhs.bounding_radius());
+	return length(lhs.center() - rhs.center()) <= reach;
 }
 
 // Interior grid nodes inside each primitive (a node may be owned by several).
@@ -1265,12 +1244,12 @@ struct RegionFit
 [[nodiscard]] RegionFit region_fit(const DistanceField& field, const std::vector<std::size_t>& region)
 {
 	const Vec3 mean = std::transform_reduce(region.begin(), region.end(), Vec3{}, std::plus<>{},
-											[&field](std::size_t node) { return node_position_of(field, node); });
+											[&field](std::size_t node) { return field.node_position(node); });
 	const Vec3 centroid = mean * (1.0F / static_cast<float>(region.size()));
 	SymMat3	   cov{};
 	for (const std::size_t node : region)
 	{
-		const Vec3 off = node_position_of(field, node) - centroid;
+		const Vec3 off = field.node_position(node) - centroid;
 		cov.xx += off.x * off.x;
 		cov.yy += off.y * off.y;
 		cov.zz += off.z * off.z;
@@ -1282,7 +1261,7 @@ struct RegionFit
 	std::array<float, 3> ext{};
 	for (const std::size_t node : region)
 	{
-		const Vec3 off = node_position_of(field, node) - centroid;
+		const Vec3 off = field.node_position(node) - centroid;
 		for (std::size_t dim = 0; dim < 3; ++dim)
 		{
 			ext.at(dim) = std::max(ext.at(dim), std::abs(dot(off, eigen.vectors.at(dim))));
@@ -1351,7 +1330,7 @@ struct RegionFit
 		part,
 		[&field, &prim, &others](std::size_t node)
 		{
-			const Vec3 pos = node_position_of(field, node);
+			const Vec3 pos = field.node_position(node);
 			return sd_primitive(pos, prim) <= 0.0F ||
 				   std::ranges::any_of(others, [pos](const Primitive& other) { return sd_primitive(pos, other) <= 0.0F; });
 		}));
@@ -1525,7 +1504,7 @@ constexpr float SWALLOW_RETAIN = 0.90F; // the grown coverer must still hold thi
 		part,
 		[&field, &prims](std::size_t node)
 		{
-			const Vec3 pos = node_position_of(field, node);
+			const Vec3 pos = field.node_position(node);
 			return std::ranges::any_of(prims, [pos](const Primitive& prim) { return sd_primitive(pos, prim) <= 0.0F; });
 		}));
 	return static_cast<float>(covered) / static_cast<float>(part.size());
@@ -1546,7 +1525,7 @@ constexpr float SWALLOW_RETAIN = 0.90F; // the grown coverer must still hold thi
 		}
 		const auto count = static_cast<std::size_t>(std::ranges::count_if(
 			part, [&field, &prims, idx](std::size_t node)
-			{ return sd_primitive(node_position_of(field, node), prims.at(idx)) <= 0.0F; }));
+			{ return sd_primitive(field.node_position(node), prims.at(idx)) <= 0.0F; }));
 		if (count > best_count)
 		{
 			best_count = count;

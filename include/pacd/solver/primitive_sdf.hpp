@@ -25,11 +25,10 @@ namespace pacd::solver
 
 [[nodiscard]] inline float sd_box(Vec3 point, const Box& box) noexcept
 {
-	const Vec3	local = rotate_inverse(box.rot, point - box.pos);
-	const Vec3	half{.x = box.size.x * 0.5F, .y = box.size.y * 0.5F, .z = box.size.z * 0.5F};
-	const Vec3	dvec{.x = std::abs(local.x) - half.x, .y = std::abs(local.y) - half.y, .z = std::abs(local.z) - half.z};
-	const Vec3	outside{.x = std::max(dvec.x, 0.0F), .y = std::max(dvec.y, 0.0F), .z = std::max(dvec.z, 0.0F)};
-	const float inside = std::min(std::max({dvec.x, dvec.y, dvec.z}), 0.0F);
+	const Vec3	local	= rotate_inverse(box.rot, point - box.pos);
+	const Vec3	dvec	= abs(local) - (box.size * 0.5F);
+	const Vec3	outside = max(dvec, Vec3{});
+	const float inside	= std::min(std::max({dvec.x, dvec.y, dvec.z}), 0.0F);
 	return length(outside) + inside;
 }
 

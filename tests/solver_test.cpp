@@ -164,55 +164,6 @@ namespace
 	return config;
 }
 
-// World-space long axis of a fitted primitive (its local longest extent rotated
-// into world space): +Y for a cylinder, the widest local axis for a box.
-[[nodiscard]] Vec3 primitive_long_axis(const Primitive& prim)
-{
-	if (std::holds_alternative<Cylinder>(prim))
-	{
-		return rotate(std::get<Cylinder>(prim).rot, vec3(0.0F, 1.0F, 0.0F));
-	}
-	const Box& box	 = std::get<Box>(prim);
-	Vec3	   local = vec3(1.0F, 0.0F, 0.0F);
-	if (box.size.y >= box.size.x && box.size.y >= box.size.z)
-	{
-		local = vec3(0.0F, 1.0F, 0.0F);
-	}
-	else if (box.size.z >= box.size.x && box.size.z >= box.size.y)
-	{
-		local = vec3(0.0F, 0.0F, 1.0F);
-	}
-	return rotate(box.rot, local);
-}
-
-[[nodiscard]] Vec3 primitive_center(const Primitive& prim)
-{
-	if (std::holds_alternative<Sphere>(prim))
-	{
-		return std::get<Sphere>(prim).pos;
-	}
-	if (std::holds_alternative<Box>(prim))
-	{
-		return std::get<Box>(prim).pos;
-	}
-	return std::get<Cylinder>(prim).pos;
-}
-
-// World-space extent of a fitted primitive along its longest axis: a cylinder's
-// height, a box's widest side, a sphere's diameter.
-[[nodiscard]] float primitive_long_extent(const Primitive& prim)
-{
-	if (std::holds_alternative<Cylinder>(prim))
-	{
-		return std::get<Cylinder>(prim).height;
-	}
-	if (std::holds_alternative<Box>(prim))
-	{
-		const Vec3 size = std::get<Box>(prim).size;
-		return std::max({size.x, size.y, size.z});
-	}
-	return 2.0F * std::get<Sphere>(prim).radius;
-}
 
 // A scalar summary of a primitive's dimensions -- identical for exact replicas.
 [[nodiscard]] float primitive_size_signature(const Primitive& prim)
@@ -305,7 +256,7 @@ TEST_CASE("decompose orients a primitive along an oblique beam", "[decompose]")
 	REQUIRE_FALSE(std::holds_alternative<Sphere>(parts.front())); // a sphere has no long axis
 
 	const Vec3 beam_axis = rotate(rot, vec3(1.0F, 0.0F, 0.0F));
-	const Vec3 fit_axis	 = primitive_long_axis(parts.front());
+	const Vec3 fit_axis	 = parts.front().long_axis();
 	// Aligned within ~15 deg (|cos| > ~0.87); an axis-aligned fit would score ~0.71.
 	REQUIRE(std::abs(dot(beam_axis, fit_axis)) > 0.87F);
 }
@@ -330,8 +281,8 @@ TEST_CASE("decompose grows one primitive along an elongated beam", "[decompose]"
 
 	// The lone primitive should cover well over half of the 6-unit length and lie
 	// along the beam (world +X): without bounded growth it stalls near ~1 unit.
-	REQUIRE(primitive_long_extent(parts.front()) > 4.0F);
-	REQUIRE(std::abs(primitive_long_axis(parts.front()).x) > 0.9F);
+	REQUIRE(parts.front().long_extent() > 4.0F);
+	REQUIRE(std::abs(parts.front().long_axis().x) > 0.9F);
 }
 
 TEST_CASE("merging never increases the count and preserves coverage", "[decompose]")
@@ -397,20 +348,20 @@ TEST_CASE("decompose replicates primitives across a mirror symmetry", "[decompos
 	REQUIRE(parts.size() >= 2);
 
 	// Both lobes are covered.
-	const auto min_x = std::ranges::min(parts, {}, [](const Primitive& prim) { return primitive_center(prim).x; });
-	const auto max_x = std::ranges::max(parts, {}, [](const Primitive& prim) { return primitive_center(prim).x; });
-	REQUIRE(primitive_center(min_x).x < 0.0F);
-	REQUIRE(primitive_center(max_x).x > 0.0F);
+	const auto min_x = std::ranges::min(parts, {}, [](const Primitive& prim) { return prim.center().x; });
+	const auto max_x = std::ranges::max(parts, {}, [](const Primitive& prim) { return prim.center().x; });
+	REQUIRE(min_x.center().x < 0.0F);
+	REQUIRE(max_x.center().x > 0.0F);
 
 	// Every primitive has an exact-size mirror partner in the opposite lobe.
 	for (const Primitive& prim : parts)
 	{
-		const Vec3	center = primitive_center(prim);
+		const Vec3	center = prim.center();
 		const float sig	   = primitive_size_signature(prim);
 		const bool	paired = std::ranges::any_of(parts,
 												 [&](const Primitive& other)
 												 {
-													const Vec3 other_c = primitive_center(other);
+													const Vec3 other_c = other.center();
 													return std::abs(sig - primitive_size_signature(other)) < EPS &&
 														   std::abs(other_c.x + center.x) < 0.15F &&
 														   std::abs(other_c.y - center.y) < 0.15F &&

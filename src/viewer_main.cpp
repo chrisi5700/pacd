@@ -162,19 +162,6 @@ void print_usage()
 	return args;
 }
 
-[[nodiscard]] const char* kind_name(const solver::Primitive& prim)
-{
-	if (std::holds_alternative<solver::Sphere>(prim))
-	{
-		return "sphere";
-	}
-	if (std::holds_alternative<solver::Box>(prim))
-	{
-		return "box";
-	}
-	return "cylinder";
-}
-
 // Rotation matrix (column-major) from a unit quaternion.
 [[nodiscard]] Mat4 quat_to_mat4(const solver::Quat& rot)
 {
@@ -247,7 +234,7 @@ void print_usage()
 	config.max_primitives = 24;
 	config.on_field_built = [] { fmt::print(stderr, "  distance field built; fitting primitives...\n"); };
 	config.on_primitive	  = [](std::size_t placed, const solver::Primitive& prim)
-	{ fmt::print(stderr, "  placed primitive {} ({})\n", placed, kind_name(prim)); };
+	{ fmt::print(stderr, "  placed primitive {} ({})\n", placed, prim.kind_name()); };
 	return config;
 }
 

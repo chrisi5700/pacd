@@ -19,10 +19,8 @@ void Aabb::expand(Vec3 point) noexcept {
         empty = false;
         return;
     }
-    min_point = {std::min(min_point.x, point.x), std::min(min_point.y, point.y),
-                 std::min(min_point.z, point.z)};
-    max_point = {std::max(max_point.x, point.x), std::max(max_point.y, point.y),
-                 std::max(max_point.z, point.z)};
+    min_point = min(min_point, point);
+    max_point = max(max_point, point);
 }
 
 Vec3 Aabb::center() const noexcept { return (min_point + max_point) * 0.5F; }

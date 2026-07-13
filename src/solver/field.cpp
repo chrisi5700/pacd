@@ -52,8 +52,8 @@ DistanceField build_distance_field(const TriMesh& mesh, int resolution, float pa
 	Vec3 max_pt = min_pt;
 	for (const Vec3& vertex : mesh.vertices)
 	{
-		min_pt = vec3(std::min(min_pt.x, vertex.x), std::min(min_pt.y, vertex.y), std::min(min_pt.z, vertex.z));
-		max_pt = vec3(std::max(max_pt.x, vertex.x), std::max(max_pt.y, vertex.y), std::max(max_pt.z, vertex.z));
+		min_pt = min(min_pt, vertex);
+		max_pt = max(max_pt, vertex);
 	}
 
 	const Vec3	span	= max_pt - min_pt;

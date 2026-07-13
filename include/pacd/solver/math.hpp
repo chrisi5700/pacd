@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -53,6 +54,22 @@ struct Vec3
 [[nodiscard]] constexpr Vec3 operator*(float scalar, Vec3 vec) noexcept
 {
 	return vec * scalar;
+}
+
+// Componentwise minimum / maximum / absolute value.
+[[nodiscard]] constexpr Vec3 min(Vec3 lhs, Vec3 rhs) noexcept
+{
+	return {.x = std::min(lhs.x, rhs.x), .y = std::min(lhs.y, rhs.y), .z = std::min(lhs.z, rhs.z)};
+}
+
+[[nodiscard]] constexpr Vec3 max(Vec3 lhs, Vec3 rhs) noexcept
+{
+	return {.x = std::max(lhs.x, rhs.x), .y = std::max(lhs.y, rhs.y), .z = std::max(lhs.z, rhs.z)};
+}
+
+[[nodiscard]] inline Vec3 abs(Vec3 vec) noexcept
+{
+	return {.x = std::abs(vec.x), .y = std::abs(vec.y), .z = std::abs(vec.z)};
 }
 
 [[nodiscard]] constexpr float dot(Vec3 lhs, Vec3 rhs) noexcept
