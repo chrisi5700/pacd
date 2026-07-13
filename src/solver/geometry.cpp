@@ -67,8 +67,10 @@ namespace
 	return tri.a + (ab * (vb * denom)) + (ac * (vc * denom));
 }
 
+} // namespace
+
 // Signed solid angle subtended by `tri` at `point` (Van Oosterom & Strackee).
-[[nodiscard]] float solid_angle(Vec3 point, const Tri& tri) noexcept
+float solid_angle(Vec3 point, const Tri& tri) noexcept
 {
 	const Vec3	pa = tri.a - point;
 	const Vec3	pb = tri.b - point;
@@ -81,8 +83,6 @@ namespace
 	const float denom	  = (la * lb * lc) + (dot(pa, pb) * lc) + (dot(pb, pc) * la) + (dot(pc, pa) * lb);
 	return 2.0F * std::atan2(numerator, denom);
 }
-
-} // namespace
 // NOLINTEND(readability-identifier-length)
 
 float distance_point_triangle(Vec3 point, const Tri& tri) noexcept

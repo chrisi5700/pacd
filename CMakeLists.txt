@@ -83,6 +83,7 @@ target_compile_features(pacd-viewer PRIVATE cxx_std_23)
 find_package(Threads REQUIRED)
 target_add_library(pacd_solver
     src/solver/geometry.cpp
+    src/solver/bvh.cpp
     src/solver/field.cpp
     src/solver/decompose.cpp
 )

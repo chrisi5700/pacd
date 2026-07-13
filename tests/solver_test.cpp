@@ -2,6 +2,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <variant>
 
+#include "pacd/solver/bvh.hpp"
 #include "pacd/solver/field.hpp"
 #include "pacd/solver/geometry.hpp"
 #include "pacd/solver/math.hpp"
@@ -379,4 +380,30 @@ TEST_CASE("decompose is deterministic and rejects degenerate input", "[decompose
 	const auto	  first_run	 = decompose(cube, fast_config());
 	const auto	  second_run = decompose(cube, fast_config());
 	REQUIRE(first_run.size() == second_run.size());
+}
+
+TEST_CASE("BVH reproduces the brute-force distance and winding sign", "[bvh]")
+{
+	// The BVH is the accelerated oracle behind the field build: its nearest-triangle
+	// distance must be exact, and its fast winding number must agree with the brute
+	// sum in sign (away from the surface, where winding ~= 0.5 is genuinely ambiguous)
+	// and stay close in value.
+	const TriMesh mesh = test::make_two_box_mesh(0.8F, 1.5F); // two lobes -> a real hierarchy
+	const TriBvh  bvh(mesh);
+
+	const std::vector<Vec3> probes = {vec3(1.5F, 0.0F, 0.0F),  vec3(-1.5F, 0.2F, -0.1F), vec3(0.0F, 0.0F, 0.0F),
+									  vec3(1.5F, 0.9F, 0.5F),  vec3(3.0F, 0.0F, 0.0F),	 vec3(-3.0F, 2.0F, 1.0F),
+									  vec3(1.2F, -0.3F, 0.4F), vec3(0.7F, 0.7F, -0.7F)};
+	for (const Vec3 probe : probes)
+	{
+		REQUIRE(bvh.unsigned_distance(probe) == Approx(unsigned_distance(mesh, probe)).margin(1.0e-5F));
+
+		const float brute = winding_number(mesh, probe);
+		const float fast  = bvh.winding_number(probe);
+		REQUIRE(fast == Approx(brute).margin(0.02F));
+		if (std::abs(brute - 0.5F) > 0.05F) // skip only genuinely on-surface points
+		{
+			REQUIRE((fast > 0.5F) == (brute > 0.5F));
+		}
+	}
 }

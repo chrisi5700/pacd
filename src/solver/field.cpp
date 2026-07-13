@@ -6,10 +6,17 @@
 #include <thread>
 #include <vector>
 
+#include "pacd/solver/bvh.hpp"
 #include "pacd/solver/geometry.hpp"
 
 namespace pacd::solver
 {
+
+// Half-width of the inside/outside boundary band around winding 0.5 within which the
+// fast winding number is replaced by the exact one, so on-surface nodes are signed
+// identically to the reference field. Comfortably wider than the fast winding's
+// far-field error, yet far from the ~0 / ~1 winding of genuine exterior / interior.
+constexpr float WINDING_BOUNDARY_BAND = 0.05F;
 
 float DistanceField::sample(Vec3 point) const
 {
@@ -72,20 +79,37 @@ DistanceField build_distance_field(const TriMesh& mesh, int resolution, float pa
 	field.nz	 = std::max(2, static_cast<int>(std::ceil(padded.z / spacing)) + 1);
 	field.data.resize(field.node_count());
 
+	// One BVH accelerates both halves of each node's signed distance -- the nearest
+	// triangle and the winding-number sign -- from O(triangles) to ~O(log triangles).
+	// It is built once and queried read-only, so all workers share it.
+	const TriBvh bvh(mesh);
+
 	// Each node's signed distance depends only on its own position -- no shared
 	// state, no ordering -- so the grid fills in parallel with zero synchronisation:
 	// contiguous flat-index ranges are handed to worker threads that write disjoint
-	// slots. The result is bit-identical to a serial fill, just faster; the O(nodes
-	// x triangles) brute force here is the field build's whole cost.
+	// slots. The result matches a serial fill; parallelism only changes wall-clock.
 	const std::size_t total = field.node_count();
 	const auto		  cores = static_cast<std::size_t>(std::max(1U, std::thread::hardware_concurrency()));
 	const std::size_t workers = std::max<std::size_t>(1, std::min(cores, total));
 
-	const auto fill_range = [&mesh, &field](std::size_t begin, std::size_t end)
+	// The fast winding number is approximate, and its tree-ordered sum rounds a hair
+	// differently from the brute sum right at the 0.5 inside/outside boundary -- which
+	// only matters for the few nodes sitting almost exactly on the surface. For those
+	// (a thin O(surface) band, not the O(volume) interior) recompute the exact winding
+	// so the sign matches the reference field node-for-node; everywhere else the fast
+	// winding is ~0 or ~1, nowhere near the boundary.
+	const auto fill_range = [&bvh, &mesh, &field](std::size_t begin, std::size_t end)
 	{
 		for (std::size_t node = begin; node < end; ++node)
 		{
-			field.data.at(node) = signed_distance(mesh, field.node_position(node));
+			const Vec3	point	 = field.node_position(node);
+			const float distance = bvh.unsigned_distance(point);
+			float		winding	 = bvh.winding_number(point);
+			if (std::abs(winding - 0.5F) < WINDING_BOUNDARY_BAND)
+			{
+				winding = winding_number(mesh, point);
+			}
+			field.data.at(node) = (winding > 0.5F) ? -distance : distance;
 		}
 	};
 
