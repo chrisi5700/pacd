@@ -8,6 +8,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -777,17 +778,49 @@ constexpr float SAMPLE_SPAN = 2.5F;
 	return kinds;
 }
 
+// Fit every enabled primitive type at the seed, each on its own thread. Every fit
+// is an independent, deterministic optimisation over the same fixed sample set (the
+// RNG is spent building those samples earlier), so running them concurrently
+// changes only the wall-clock: the fits come back in enabled_kinds order and
+// callers select over them exactly as a serial loop would -- bit-identical output.
+[[nodiscard]] std::vector<Fit> optimize_kinds(const std::vector<Kind>& kinds, const Seed& seed, const SeedFrame& frame,
+											  const Window& window, const Context& context, const SolverConfig& config,
+											  float scale)
+{
+	std::vector<Fit> fits(kinds.size());
+	const auto		 run = [&](std::size_t idx)
+	{ fits.at(idx) = optimize(kinds.at(idx), seed_params_windowed(kinds.at(idx), seed, frame, window), context, config, scale); };
+
+	std::vector<std::thread> pool;
+	pool.reserve(kinds.size());
+	for (std::size_t idx = 1; idx < kinds.size(); ++idx)
+	{
+		pool.emplace_back(run, idx); // distinct fits slots -> no synchronisation
+	}
+	if (!kinds.empty())
+	{
+		run(0); // this thread takes the first kind
+	}
+	for (std::thread& worker : pool)
+	{
+		worker.join();
+	}
+	return fits;
+}
+
 // Try every enabled primitive type at the seed; keep the best inscribed fit.
 // The window supplies corridor-filling initial parameters for elongated regions
 // (isotropic regions leave it disabled and fall back to PCA-warm-started seeds).
 [[nodiscard]] std::optional<Fit> best_fit(const Seed& seed, const SeedFrame& frame, const Window& window,
 										  const Context& context, const SolverConfig& config, float scale)
 {
+	const std::vector<Kind> kinds = enabled_kinds(config);
+	const std::vector<Fit>	fits  = optimize_kinds(kinds, seed, frame, window, context, config, scale);
+
 	std::optional<Fit> best;
 	float			   best_fresh = 0.0F;
-	for (const Kind kind : enabled_kinds(config))
+	for (const Fit& fit : fits)
 	{
-		const Fit	fit		   = optimize(kind, seed_params_windowed(kind, seed, frame, window), context, config, scale);
 		const float protrusion = (fit.obj.total > 0.0F) ? (fit.obj.total - fit.obj.interior) / fit.obj.total : 1.0F;
 		if (protrusion > config.max_protrusion)
 		{
@@ -1300,12 +1333,12 @@ struct RegionFit
 											  .weight  = &weight,
 											  .tau	   = config.occupancy_tau * scale,
 											  .lambda  = config.protrusion_weight};
-	std::optional<Fit>			   best;
-	float						   best_fresh = 0.0F;
-	for (const Kind kind : enabled_kinds(config))
+	const std::vector<Fit> fits =
+		optimize_kinds(enabled_kinds(config), region.seed, region.frame, region.window, context, config, scale);
+	std::optional<Fit> best;
+	float			   best_fresh = 0.0F;
+	for (const Fit& fit : fits)
 	{
-		const Fit fit =
-			optimize(kind, seed_params_windowed(kind, region.seed, region.frame, region.window), context, config, scale);
 		if (fit.obj.fresh > best_fresh)
 		{
 			best_fresh = fit.obj.fresh;
