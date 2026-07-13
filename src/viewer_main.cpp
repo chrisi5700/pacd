@@ -228,9 +228,9 @@ void print_usage()
 [[nodiscard]] solver::SolverConfig viewer_config()
 {
 	solver::SolverConfig config;
-	config.sdf_resolution = 32;
+	config.sdf_resolution = 64;
 	config.sample_count	  = 1200;
-	config.gd_iterations  = 60;
+	config.gd_iterations  = 300;
 	config.max_primitives = 24;
 	config.on_field_built = [] { fmt::print(stderr, "  distance field built; fitting primitives...\n"); };
 	config.on_primitive	  = [](std::size_t placed, const solver::Primitive& prim)
@@ -303,7 +303,7 @@ void quality_controls(solver::SolverConfig& config)
 	ImGui::SeparatorText("Quality / cost");
 	ImGui::SliderInt("SDF resolution", &config.sdf_resolution, 8, 96);
 	ImGui::SliderInt("samples", &config.sample_count, 200, 8000);
-	ImGui::SliderInt("GD iterations", &config.gd_iterations, 10, 300);
+	ImGui::SliderInt("GD iterations", &config.gd_iterations, 10, 1000);
 	ImGui::SliderFloat("learning rate", &config.learning_rate, 0.001F, 0.2F, "%.3f");
 }
 

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -31,6 +32,9 @@ namespace {
 
 constexpr float ORBIT_SPEED = 0.008F;
 constexpr std::size_t MAX_LIGHTS = 4;
+
+// Interactive screenshots (the S key) collect here, next to the repo's showcase.
+constexpr std::string_view SCREENSHOT_DIR = "img";
 
 constexpr std::string_view VERTEX_SRC = R"(#version 330 core
 layout(location = 0) in vec3 a_position;
@@ -418,9 +422,21 @@ void Viewer::handle_key(int key, int action) {
     } else if (key == GLFW_KEY_W) {
         m_wireframe = !m_wireframe;
     } else if (key == GLFW_KEY_S) {
-        const std::string name = "pacd-shot-" + std::to_string(m_screenshot_index) + ".png";
+        // Collect shots in the showcase dir, and skip past any left by earlier
+        // sessions so restarting appends instead of overwriting shot 0 onward.
+        const std::filesystem::path dir{SCREENSHOT_DIR};
+        std::error_code mkdir_ec;
+        std::filesystem::create_directories(dir, mkdir_ec);
+        auto shot_path = [&dir](int index) {
+            return dir / ("pacd-shot-" + std::to_string(index) + ".png");
+        };
+        std::filesystem::path path = shot_path(m_screenshot_index);
+        while (std::filesystem::exists(path)) {
+            ++m_screenshot_index;
+            path = shot_path(m_screenshot_index);
+        }
         ++m_screenshot_index;
-        std::ignore = save_screenshot(name);
+        std::ignore = save_screenshot(path.string());
     } else if (key == GLFW_KEY_LEFT) {
         if (m_on_cycle) {
             m_on_cycle(-1);
