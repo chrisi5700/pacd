@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <thread>
+#include <vector>
 
 #include "pacd/solver/geometry.hpp"
 
@@ -70,15 +72,35 @@ DistanceField build_distance_field(const TriMesh& mesh, int resolution, float pa
 	field.nz	 = std::max(2, static_cast<int>(std::ceil(padded.z / spacing)) + 1);
 	field.data.resize(field.node_count());
 
-	for (int k = 0; k < field.nz; ++k)
+	// Each node's signed distance depends only on its own position -- no shared
+	// state, no ordering -- so the grid fills in parallel with zero synchronisation:
+	// contiguous flat-index ranges are handed to worker threads that write disjoint
+	// slots. The result is bit-identical to a serial fill, just faster; the O(nodes
+	// x triangles) brute force here is the field build's whole cost.
+	const std::size_t total = field.node_count();
+	const auto		  cores = static_cast<std::size_t>(std::max(1U, std::thread::hardware_concurrency()));
+	const std::size_t workers = std::max<std::size_t>(1, std::min(cores, total));
+
+	const auto fill_range = [&mesh, &field](std::size_t begin, std::size_t end)
 	{
-		for (int j = 0; j < field.ny; ++j)
+		for (std::size_t node = begin; node < end; ++node)
 		{
-			for (int i = 0; i < field.nx; ++i)
-			{
-				field.data.at(field.linear_index(i, j, k)) = signed_distance(mesh, field.node_position(i, j, k));
-			}
+			field.data.at(node) = signed_distance(mesh, field.node_position(node));
 		}
+	};
+
+	const std::size_t		 chunk = (total + workers - 1) / workers;
+	std::vector<std::thread> pool;
+	pool.reserve(workers - 1);
+	for (std::size_t slot = 1; slot < workers; ++slot)
+	{
+		const std::size_t begin = std::min(slot * chunk, total);
+		pool.emplace_back(fill_range, begin, std::min(begin + chunk, total));
+	}
+	fill_range(0, std::min(chunk, total)); // this thread takes the first chunk
+	for (std::thread& worker : pool)
+	{
+		worker.join();
 	}
 	return field;
 }

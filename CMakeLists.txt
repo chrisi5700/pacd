@@ -80,12 +80,14 @@ target_compile_features(pacd-viewer PRIVATE cxx_std_23)
 # Core convex-decomposition library: TriMesh + primitives + the decompose() API.
 # No render/GL dependency; render_bridge.hpp (header-only) is the sole opt-in
 # link to the renderer, used to turn a loaded mesh into the solver's TriMesh.
+find_package(Threads REQUIRED)
 target_add_library(pacd_solver
     src/solver/geometry.cpp
     src/solver/field.cpp
     src/solver/decompose.cpp
 )
 target_include_directories(pacd_solver PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(pacd_solver PRIVATE Threads::Threads)
 target_compile_features(pacd_solver PUBLIC cxx_std_23)
 
 add_subdirectory(playground)
