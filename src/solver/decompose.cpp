@@ -1333,12 +1333,16 @@ struct RegionFit
 											  .weight  = &weight,
 											  .tau	   = config.occupancy_tau * scale,
 											  .lambda  = config.protrusion_weight};
-	const std::vector<Fit> fits =
-		optimize_kinds(enabled_kinds(config), region.seed, region.frame, region.window, context, config, scale);
-	std::optional<Fit> best;
-	float			   best_fresh = 0.0F;
-	for (const Fit& fit : fits)
+	// The kinds are fitted serially here (unlike best_fit), because merge candidates
+	// are themselves evaluated in parallel across pairs -- adding per-kind threads on
+	// top would only oversubscribe the cores the pair loop already saturates.
+	const std::vector<Kind> kinds = enabled_kinds(config);
+	std::optional<Fit>		best;
+	float					best_fresh = 0.0F;
+	for (const Kind kind : kinds)
 	{
+		const Fit fit =
+			optimize(kind, seed_params_windowed(kind, region.seed, region.frame, region.window), context, config, scale);
 		if (fit.obj.fresh > best_fresh)
 		{
 			best_fresh = fit.obj.fresh;
@@ -1413,33 +1417,43 @@ struct MergeInputs
 	const std::vector<std::vector<std::size_t>>* owned{nullptr};
 };
 
+// A random stream seeded only from a pair's positions and the run seed, so each
+// pair's Monte-Carlo fit is reproducible on its own -- independent of which worker
+// evaluates it or in what order. That independence is exactly what lets the pairs be
+// fitted in parallel yet selected deterministically, matching a serial scan.
+[[nodiscard]] std::mt19937 pair_rng(std::size_t lhs, std::size_t rhs, unsigned seed)
+{
+	std::seed_seq seq{seed, static_cast<unsigned>(lhs), static_cast<unsigned>(rhs)};
+	return std::mt19937(seq);
+}
+
 // A merge for pair (lhs, rhs) if a single re-fit stays inscribed and re-covers at
 // least `merge_retain` of EACH substantial member's interior (counting nodes any
-// surviving primitive still holds), and the joint region is bigger than
-// `min_region` (so callers converge on the largest merge available this round).
-// Retain is checked per-primitive, not over a union fraction: a lone fin folded
-// into a big body holds only a handful of the union's nodes, so a union fraction
-// would round its loss away and let the body swallow it -- the very cascade that
-// collapses a rocket to one cylinder. Debris-sized members are exempt (see below)
-// so aliasing left-overs still get absorbed.
-[[nodiscard]] std::optional<MergeChoice> evaluate_pair(const MergeInputs& inputs, std::size_t lhs, std::size_t rhs,
-													   const SolverConfig& config, std::mt19937& rng,
-													   std::size_t min_region)
+// surviving primitive still holds). Retain is checked per-primitive, not over a union
+// fraction: a lone fin folded into a big body holds only a handful of the union's
+// nodes, so a union fraction would round its loss away and let the body swallow it --
+// the very cascade that collapses a rocket to one cylinder. Debris-sized members are
+// exempt (see below) so aliasing left-overs still get absorbed. Depends only on the
+// pair and its surroundings (no best-so-far pruning), so it is safe to run in
+// parallel; the caller ranks the results.
+[[nodiscard]] MergeChoice evaluate_pair(const MergeInputs& inputs, std::size_t lhs, std::size_t rhs,
+										const SolverConfig& config)
 {
 	if (!bounds_near(inputs.result->at(lhs), inputs.result->at(rhs)))
 	{
-		return std::nullopt;
+		return {};
 	}
 	const std::vector<std::size_t> region = region_union(inputs.owned->at(lhs), inputs.owned->at(rhs));
-	if (region.size() < MERGE_MIN_REGION || region.size() <= min_region)
+	if (region.size() < MERGE_MIN_REGION)
 	{
-		return std::nullopt;
+		return {};
 	}
 	const std::vector<Primitive> others = without_pair(*inputs.result, lhs, rhs);
+	std::mt19937				 rng   = pair_rng(lhs, rhs, config.seed);
 	const std::optional<Fit>	 cand  = merge_fit(*inputs.field, region_fit(*inputs.field, region), others, config, rng);
 	if (!cand)
 	{
-		return std::nullopt;
+		return {};
 	}
 	// A member too small to be a real feature is aliasing debris the greedy left
 	// behind chasing the last percent of coverage; it should be absorbed, not
@@ -1453,36 +1467,124 @@ struct MergeInputs
 	};
 	if (!member_ok(lhs) || !member_ok(rhs) || merge_protrusion(*inputs.field, cand->prim) > config.max_protrusion)
 	{
-		return std::nullopt;
+		return {};
 	}
 	return MergeChoice{.lhs = lhs, .rhs = rhs, .prim = cand->prim, .region_size = region.size(), .found = true};
 }
 
-[[nodiscard]] MergeChoice find_best_merge(const MergeInputs& inputs, const SolverConfig& config, std::mt19937& rng)
+// Run `body(idx)` for every idx in [0, count) across the hardware threads, each worker
+// taking a contiguous range so their writes never overlap. Mirrors the field build's
+// parallel fill; the result is a serial loop's, only the wall-clock differs.
+void parallel_for(std::size_t count, const std::function<void(std::size_t)>& body)
 {
-	MergeChoice best;
-	for (std::size_t i = 0; i < inputs.result->size(); ++i)
+	if (count == 0)
 	{
-		for (std::size_t j = i + 1; j < inputs.result->size(); ++j)
+		return;
+	}
+	const auto		  cores	  = static_cast<std::size_t>(std::max(1U, std::thread::hardware_concurrency()));
+	const std::size_t workers = std::max<std::size_t>(1, std::min(cores, count));
+	const std::size_t chunk	  = (count + workers - 1) / workers;
+	const auto		  run_range = [&body](std::size_t begin, std::size_t end)
+	{
+		for (std::size_t idx = begin; idx < end; ++idx)
 		{
-			const std::optional<MergeChoice> choice = evaluate_pair(inputs, i, j, config, rng, best.region_size);
-			if (choice.has_value())
+			body(idx);
+		}
+	};
+	std::vector<std::thread> pool;
+	pool.reserve(workers - 1);
+	for (std::size_t slot = 1; slot < workers; ++slot)
+	{
+		const std::size_t begin = std::min(slot * chunk, count);
+		pool.emplace_back(run_range, begin, std::min(begin + chunk, count));
+	}
+	run_range(0, std::min(chunk, count));
+	for (std::thread& worker : pool)
+	{
+		worker.join();
+	}
+}
+
+// A pair worth fitting: its two primitives and the size of their joint region, which
+// ranks it. Enumerated cheaply (no fit) so the expensive fits can be tried in
+// priority order and stopped as soon as one succeeds.
+struct MergeCandidate
+{
+	std::size_t lhs{0};
+	std::size_t rhs{0};
+	std::size_t region_size{0};
+};
+
+// Every adjacent pair with a substantial joint region, largest region first (ties by
+// scan order). This is the cheap half of the pass -- bounds tests and node-set unions,
+// no gradient descent -- and it fixes the order the fits are then attempted in.
+[[nodiscard]] std::vector<MergeCandidate> merge_candidates(const MergeInputs& inputs)
+{
+	const std::size_t			count = inputs.result->size();
+	std::vector<MergeCandidate> cands;
+	for (std::size_t i = 0; i < count; ++i)
+	{
+		for (std::size_t j = i + 1; j < count; ++j)
+		{
+			if (!bounds_near(inputs.result->at(i), inputs.result->at(j)))
 			{
-				best = *choice;
+				continue;
+			}
+			const std::size_t region = region_union(inputs.owned->at(i), inputs.owned->at(j)).size();
+			if (region >= MERGE_MIN_REGION)
+			{
+				cands.push_back({.lhs = i, .rhs = j, .region_size = region});
 			}
 		}
 	}
-	return best;
+	std::ranges::sort(cands,
+					  [](const MergeCandidate& lhs, const MergeCandidate& rhs)
+					  {
+						  if (lhs.region_size != rhs.region_size)
+						  {
+							  return lhs.region_size > rhs.region_size;
+						  }
+						  if (lhs.lhs != rhs.lhs)
+						  {
+							  return lhs.lhs < rhs.lhs;
+						  }
+						  return lhs.rhs < rhs.rhs;
+					  });
+	return cands;
 }
 
-void merge_pass(const DistanceField& field, const SolverConfig& config, std::mt19937& rng,
-				std::vector<Primitive>& result)
+// Fit candidates largest-region-first, and return the first that yields a valid merge
+// -- identical to the pair a serial best-so-far scan selects, since no later (smaller)
+// region can outrank it. The fits run in parallel batches and the search stops at the
+// first batch that produces one, so a simple mesh fits only a handful of pairs while a
+// clustered mesh fans hundreds of independent fits across the cores.
+[[nodiscard]] MergeChoice find_best_merge(const MergeInputs& inputs, const SolverConfig& config)
+{
+	const std::vector<MergeCandidate> cands = merge_candidates(inputs);
+	const auto cores = static_cast<std::size_t>(std::max(1U, std::thread::hardware_concurrency()));
+	for (std::size_t base = 0; base < cands.size(); base += cores)
+	{
+		const std::size_t		 batch = std::min(cores, cands.size() - base);
+		std::vector<MergeChoice> evals(batch);
+		parallel_for(batch,
+					 [&](std::size_t pos)
+					 { evals.at(pos) = evaluate_pair(inputs, cands.at(base + pos).lhs, cands.at(base + pos).rhs, config); });
+		const auto hit = std::ranges::find_if(evals, [](const MergeChoice& eval) { return eval.found; });
+		if (hit != evals.end())
+		{
+			return *hit;
+		}
+	}
+	return {};
+}
+
+void merge_pass(const DistanceField& field, const SolverConfig& config, std::vector<Primitive>& result)
 {
 	while (result.size() > 1)
 	{
 		const std::vector<std::vector<std::size_t>> owned = owned_nodes(field, result);
 		const MergeInputs							inputs{.field = &field, .result = &result, .owned = &owned};
-		const MergeChoice							choice = find_best_merge(inputs, config, rng);
+		const MergeChoice							choice = find_best_merge(inputs, config);
 		if (!choice.found)
 		{
 			break;
@@ -1755,7 +1857,7 @@ std::vector<Primitive> decompose(const TriMesh& mesh, const SolverConfig& config
 	// giving up coverage.
 	if (config.merge_primitives)
 	{
-		merge_pass(field, config, rng, result);
+		merge_pass(field, config, result);
 		swallow_pass(field, config, rng, result);
 		prune_redundant(field, result);
 	}

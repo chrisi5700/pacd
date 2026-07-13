@@ -95,7 +95,10 @@ the mesh surface).
   exempt, so that debris is still absorbed. Applied greedily (largest region first,
   repeated to a fixpoint), it collapses a cluster while leaving distinct features
   standing — on the composite corpus this cuts primitive count *and* nudges mean
-  IoU up.
+  IoU up. Each round's candidate re-fits are independent, so they run in parallel
+  across cores, largest-region-first and stopping at the first that sticks; on dense
+  meshes (screws) this is a 4–16× speedup over the serial pass, which dominated the
+  solver's runtime once the field build was itself parallelised.
 
 - **Swallow redundant leftovers.** A merge re-fits one primitive to a *pair* and
   so leaves them split when one is a redundant left-over sitting mostly inside
