@@ -119,6 +119,20 @@
         "vcpkg"
       ],
       "description": "Release build with vcpkg dependency management"
+    },
+    {
+      "name": "core",
+      "inherits": "base",
+      "displayName": "Lean core: solver only (C++20, no viewer/tests/bench, no package manager)",
+      "description": "Consumable-library build: only pacd_solver, with no vcpkg / GL / logging dependencies. Guards the downstream-consumer path and verifies the solver compiles as C++20.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_STANDARD": "20",
+        "CMAKE_CXX_STANDARD_REQUIRED": "ON",
+        "PACD_BUILD_VIEWER": "OFF",
+        "PACD_BUILD_TESTS": "OFF",
+        "PACD_BUILD_BENCH": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -155,6 +169,11 @@
     {
       "name": "release-vcpkg",
       "configurePreset": "release-vcpkg",
+      "jobs": 0
+    },
+    {
+      "name": "core",
+      "configurePreset": "core",
       "jobs": 0
     }
   ],

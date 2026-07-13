@@ -283,7 +283,53 @@ ctest --test-dir build/dev-vcpkg --output-on-failure
 ```
 
 Configure presets: `dev-vcpkg`, `llm-vcpkg`, `release-vcpkg` (plus
-`dev-vcpkg-msvc`).
+`dev-vcpkg-msvc`); `core` builds just the solver with no dependencies.
+
+---
+
+## Use as a library
+
+`pacd` is consumable as a lean, dependency-light static library. The core solver
+(`pacd::solver`) needs only a C++20 compiler and threads — **no GL, no logging, no
+package manager**. The interactive viewer and dev tools are gated behind
+`PACD_BUILD_VIEWER` (default ON only when pacd is the top-level project), so a
+downstream consumer never builds or links them.
+
+**Installed package** — build the lean core, install, and `find_package` it:
+
+```sh
+cmake --preset core                        # solver only, C++20, no vcpkg
+cmake --build --preset core
+cmake --install build/core --prefix /your/prefix
+```
+
+```cmake
+# In the consumer's CMakeLists.txt
+find_package(pacd CONFIG REQUIRED)
+target_link_libraries(app PRIVATE pacd::solver)
+```
+
+**FetchContent / add_subdirectory** — no install step; the viewer auto-disables
+because pacd is no longer the top-level project:
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(pacd
+  GIT_REPOSITORY https://github.com/<you>/pacd.git
+  GIT_TAG        main)
+FetchContent_MakeAvailable(pacd)
+target_link_libraries(app PRIVATE pacd::solver)
+```
+
+Then call the API — see `examples/consumer/` for a complete, CI-tested program:
+
+```cpp
+#include <pacd/solver/mesh.hpp>
+#include <pacd/solver/solver.hpp>
+
+pacd::solver::TriMesh mesh = /* fill .vertices and .triangles */;
+std::vector<pacd::solver::Primitive> parts = pacd::solver::decompose(mesh);
+```
 
 ---
 
@@ -291,9 +337,12 @@ Configure presets: `dev-vcpkg`, `llm-vcpkg`, `release-vcpkg` (plus
 
 | Path                    | Contents                                                     |
 |-------------------------|-------------------------------------------------------------|
+| `include/pacd/solver/`  | Public solver headers — the installed library API           |
+| `src/solver/`           | Solver implementation (`decompose`, field, BVH, geometry)   |
 | `include/pacd/render/`  | Public renderer headers (`mesh`, `math`, `stl`, `scene`, …) |
 | `src/render/`           | Renderer implementation; GL backend confined to `gl/`       |
 | `src/viewer_main.cpp`   | `pacd-viewer` CLI front-end                                  |
+| `examples/consumer/`    | Minimal downstream `find_package(pacd)` project (CI smoke test) |
 | `resources/`            | Thingi10K test corpus + selection/download tooling          |
 | `tests/`                | Catch2 unit tests                                            |
 | `tools/`                | Measurement CLIs (`score-composites` fitter-quality harness) |
@@ -310,6 +359,13 @@ under `src/`, public headers under `include/`.
 
 ## Dependencies
 
-`fmt`, `spdlog` (logging), `glfw3` + `glad` (GL 3.3 loader) + `imgui` (config
-panel, viewer only), system OpenGL, `catch2` (tests), `benchmark` (benchmarks) —
-all via `vcpkg.json`.
+**Core solver (`pacd::solver`)** — none beyond a C++20 compiler and the system
+threads library. This is all a downstream consumer needs.
+
+**Dev layer**, split into `vcpkg.json` features (installed by default when building
+this repo, skipped for consumers):
+
+- `viewer` — `fmt`, `spdlog` (logging), `glfw3` + `glad` (GL 3.3 loader) + `imgui`
+  (config panel), system OpenGL.
+- `tests` — `catch2`.
+- `bench` — `benchmark`.

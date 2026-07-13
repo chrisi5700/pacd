@@ -1,0 +1,15 @@
+@PACKAGE_INIT@
+
+# pacd package config. Consumers do:
+#   find_package(pacd CONFIG REQUIRED)
+#   target_link_libraries(app PRIVATE pacd::solver)
+#
+# Only the core solver is packaged/installed -- the interactive viewer and dev
+# tools are not shipped. pacd::solver's only transitive dependency is Threads.
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+include("${CMAKE_CURRENT_LIST_DIR}/pacdTargets.cmake")
+
+check_required_components(pacd)

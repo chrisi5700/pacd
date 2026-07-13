@@ -3,19 +3,36 @@
   "name": "pacd",
   "version": "0.1.0",
   "description": "Primitive-approximate convex decomposition of triangle meshes into collision proxies",
-  "dependencies": [
-    "catch2",
-    "benchmark",
-    "fmt",
-    "spdlog",
-    "glfw3",
-    {
-      "name": "glad",
-      "features": ["gl-api-33"]
+  "dependencies": [],
+  "default-features": [
+    "viewer",
+    "tests",
+    "bench"
+  ],
+  "features": {
+    "viewer": {
+      "description": "Interactive viewer + software renderer (glfw/glad/imgui/OpenGL) and logging (spdlog/fmt). Not needed to consume the core solver library.",
+      "dependencies": [
+        "fmt",
+        "spdlog",
+        "glfw3",
+        {
+          "name": "glad",
+          "features": ["gl-api-33"]
+        },
+        {
+          "name": "imgui",
+          "features": ["glfw-binding", "opengl3-binding"]
+        }
+      ]
     },
-    {
-      "name": "imgui",
-      "features": ["glfw-binding", "opengl3-binding"]
+    "tests": {
+      "description": "Unit tests (Catch2).",
+      "dependencies": ["catch2"]
+    },
+    "bench": {
+      "description": "Benchmarks (Google Benchmark).",
+      "dependencies": ["benchmark"]
     }
-  ]
+  }
 }

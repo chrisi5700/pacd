@@ -8,6 +8,8 @@ on:
       - 'tests/**'
       - 'bench/**'
       - 'playground/**'
+      - 'tools/**'
+      - 'examples/**'
       - 'include/**'
       - 'cmake/**'
       - 'CMakeLists.txt'
@@ -21,6 +23,8 @@ on:
       - 'tests/**'
       - 'bench/**'
       - 'playground/**'
+      - 'tools/**'
+      - 'examples/**'
       - 'include/**'
       - 'cmake/**'
       - 'CMakeLists.txt'
@@ -115,3 +119,26 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build/dev-vcpkg-msvc --output-on-failure
+
+  core:
+    # Guards the consumable-library path: the lean solver must build as C++20 with
+    # no package manager and no GL/logging dependencies, install cleanly, and be
+    # usable from a downstream find_package(pacd) project via the pacd::solver target.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lukka/get-cmake@latest
+
+      - name: Build lean core (no vcpkg, no deps)
+        run: |
+          cmake --preset core
+          cmake --build --preset core
+
+      - name: Install and consume from a downstream project
+        run: |
+          cmake --install build/core --prefix "${{ github.workspace }}/_install"
+          cmake -S examples/consumer -B build/consumer \
+            -DCMAKE_PREFIX_PATH="${{ github.workspace }}/_install" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/consumer
+          "${{ github.workspace }}/build/consumer/pacd_consumer"

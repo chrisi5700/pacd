@@ -82,7 +82,9 @@ TriBvh::TriBvh(const TriMesh& mesh)
 	}
 
 	std::vector<std::size_t> order(count);
-	std::ranges::iota(order, std::size_t{0});
+	// std::ranges::iota is C++23; the plain std::iota keeps the solver buildable as C++20.
+	// NOLINTNEXTLINE(modernize-use-ranges)
+	std::iota(order.begin(), order.end(), std::size_t{0});
 	m_nodes.reserve(2 * count);
 	m_tris.reserve(count);
 	build(src, tri_low, tri_high, tri_center, order, 0, count);
