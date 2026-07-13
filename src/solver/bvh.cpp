@@ -13,8 +13,8 @@ namespace pacd::solver
 {
 namespace
 {
-constexpr std::size_t LEAF_SIZE	   = 4;			 // triangles per leaf
-constexpr float	  WINDING_BETA = 2.0F;		 // far field: dipole when dist > BETA * subtree radius
+constexpr std::size_t LEAF_SIZE	   = 4;	   // triangles per leaf
+constexpr float		  WINDING_BETA = 2.0F; // far field: dipole when dist > BETA * subtree radius
 constexpr float		  FOUR_PI	   = 4.0F * PI_F;
 
 [[nodiscard]] float axis_component(Vec3 vec, int axis) noexcept
@@ -121,7 +121,8 @@ TriBvh::Node TriBvh::make_leaf(const std::vector<Tri>& src, const std::vector<Ve
 	for (std::size_t idx = begin; idx < end; ++idx)
 	{
 		const Tri& tri = src.at(order.at(idx));
-		radius = std::max({radius, length(tri.a - leaf.center), length(tri.b - leaf.center), length(tri.c - leaf.center)});
+		radius =
+			std::max({radius, length(tri.a - leaf.center), length(tri.b - leaf.center), length(tri.c - leaf.center)});
 	}
 	leaf.radius = radius;
 	return leaf;
@@ -138,10 +139,10 @@ TriBvh::Node TriBvh::combine(const Node& left, std::size_t left_idx, const Node&
 	node.count		 = 0;
 	node.area		 = left.area + right.area;
 	node.area_normal = left.area_normal + right.area_normal;
-	node.center		 = (node.area > 0.0F)
-						   ? ((left.center * left.area) + (right.center * right.area)) * (1.0F / node.area)
-						   : left.center;
-	node.radius = std::max(length(left.center - node.center) + left.radius, length(right.center - node.center) + right.radius);
+	node.center = (node.area > 0.0F) ? ((left.center * left.area) + (right.center * right.area)) * (1.0F / node.area)
+									 : left.center;
+	node.radius =
+		std::max(length(left.center - node.center) + left.radius, length(right.center - node.center) + right.radius);
 	return node;
 }
 
@@ -176,8 +177,9 @@ std::size_t TriBvh::build(const std::vector<Tri>& src, const std::vector<Vec3>& 
 	}
 	const int		  axis = widest_axis(centroid_high - centroid_low);
 	const std::size_t mid  = begin + ((end - begin) / 2);
-	std::nth_element(order.begin() + static_cast<std::ptrdiff_t>(begin), order.begin() + static_cast<std::ptrdiff_t>(mid),
-					 order.begin() + static_cast<std::ptrdiff_t>(end), [&](std::size_t lhs, std::size_t rhs)
+	std::nth_element(order.begin() + static_cast<std::ptrdiff_t>(begin),
+					 order.begin() + static_cast<std::ptrdiff_t>(mid), order.begin() + static_cast<std::ptrdiff_t>(end),
+					 [&](std::size_t lhs, std::size_t rhs)
 					 { return axis_component(tri_center.at(lhs), axis) < axis_component(tri_center.at(rhs), axis); });
 
 	const std::size_t left	= build(src, tri_low, tri_high, tri_center, order, begin, mid);
