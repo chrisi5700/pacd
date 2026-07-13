@@ -9,6 +9,7 @@
 #include <optional>
 #include <random>
 #include <type_traits>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -1164,6 +1165,7 @@ void block_seed(const DistanceField& field, const Seed& seed, std::vector<char>&
 
 constexpr float		  MERGE_NEAR_SCALE = 1.15F; // only pairs whose bounding spheres are within this factor
 constexpr std::size_t MERGE_MIN_REGION = 8;		// ignore trivially small joint regions
+constexpr std::size_t MERGE_FEATURE_MIN = 48;	// below this a member is aliasing debris, not a feature to protect
 
 [[nodiscard]] float bounding_radius(const Primitive& prim)
 {
@@ -1334,20 +1336,32 @@ struct RegionFit
 	return best;
 }
 
-struct MergeQuality
+// Fraction of `part`'s nodes covered by primitive `prim` or by any of `others`.
+// Crediting `others` means a node another surviving primitive still holds is not a
+// loss; measuring per-primitive (rather than over a merged union) keeps a small
+// primitive's unique contribution from being diluted to nothing by a large partner.
+[[nodiscard]] float retained_fraction(const DistanceField& field, const Primitive& prim,
+									  const std::vector<std::size_t>& part, const std::vector<Primitive>& others)
 {
-	float retain{0.0F};
-	float protrusion{1.0F};
-};
+	if (part.empty())
+	{
+		return 1.0F;
+	}
+	const auto covered = static_cast<std::size_t>(std::ranges::count_if(
+		part,
+		[&field, &prim, &others](std::size_t node)
+		{
+			const Vec3 pos = node_position_of(field, node);
+			return sd_primitive(pos, prim) <= 0.0F ||
+				   std::ranges::any_of(others, [pos](const Primitive& other) { return sd_primitive(pos, other) <= 0.0F; });
+		}));
+	return static_cast<float>(covered) / static_cast<float>(part.size());
+}
 
-// How well `prim` re-covers the joint region and how much it protrudes, both on
-// the grid (the ground truth, independent of the fit's local sampling). A region
-// node counts as retained if `prim` OR any surviving primitive (`others`) covers
-// it, so the retain figure is the true post-merge coverage of the region -- a
-// node another primitive still holds is never a loss, which keeps global coverage
-// from eroding as merges compound.
-[[nodiscard]] MergeQuality merge_quality(const DistanceField& field, const Primitive& prim,
-										 const std::vector<std::size_t>& region, const std::vector<Primitive>& others)
+// How much `prim` protrudes outside the mesh: the fraction of its interior grid
+// footprint that lies in exterior (positive-field) nodes. On the grid, so it is
+// the ground truth independent of the fit's local sampling.
+[[nodiscard]] float merge_protrusion(const DistanceField& field, const Primitive& prim)
 {
 	std::size_t inside_total = 0;
 	std::size_t exterior	 = 0;
@@ -1366,17 +1380,7 @@ struct MergeQuality
 			}
 		}
 	}
-	const auto covered = static_cast<std::size_t>(std::ranges::count_if(
-		region,
-		[&field, &prim, &others](std::size_t node)
-		{
-			const Vec3 pos = node_position_of(field, node);
-			return sd_primitive(pos, prim) <= 0.0F ||
-				   std::ranges::any_of(others, [pos](const Primitive& other) { return sd_primitive(pos, other) <= 0.0F; });
-		}));
-	return {.retain = region.empty() ? 0.0F : static_cast<float>(covered) / static_cast<float>(region.size()),
-			.protrusion =
-				(inside_total > 0) ? static_cast<float>(exterior) / static_cast<float>(inside_total) : 1.0F};
+	return (inside_total > 0) ? static_cast<float>(exterior) / static_cast<float>(inside_total) : 1.0F;
 }
 
 struct MergeChoice
@@ -1398,9 +1402,14 @@ struct MergeInputs
 };
 
 // A merge for pair (lhs, rhs) if a single re-fit stays inscribed and re-covers at
-// least `merge_retain` of the pair's interior (counting nodes any surviving
-// primitive still holds), and the joint region is bigger than `min_region` (so
-// callers converge on the largest merge available this round).
+// least `merge_retain` of EACH substantial member's interior (counting nodes any
+// surviving primitive still holds), and the joint region is bigger than
+// `min_region` (so callers converge on the largest merge available this round).
+// Retain is checked per-primitive, not over a union fraction: a lone fin folded
+// into a big body holds only a handful of the union's nodes, so a union fraction
+// would round its loss away and let the body swallow it -- the very cascade that
+// collapses a rocket to one cylinder. Debris-sized members are exempt (see below)
+// so aliasing left-overs still get absorbed.
 [[nodiscard]] std::optional<MergeChoice> evaluate_pair(const MergeInputs& inputs, std::size_t lhs, std::size_t rhs,
 													   const SolverConfig& config, std::mt19937& rng,
 													   std::size_t min_region)
@@ -1420,8 +1429,17 @@ struct MergeInputs
 	{
 		return std::nullopt;
 	}
-	const MergeQuality quality = merge_quality(*inputs.field, cand->prim, region, others);
-	if (quality.retain < config.merge_retain || quality.protrusion > config.max_protrusion)
+	// A member too small to be a real feature is aliasing debris the greedy left
+	// behind chasing the last percent of coverage; it should be absorbed, not
+	// preserved, so it is exempt from the retain test. A substantial member must be
+	// genuinely re-covered on its own terms, which is what stops a distinct feature
+	// (a fin, a nose) from dissolving into a much larger body.
+	const auto member_ok = [&](std::size_t idx)
+	{
+		return inputs.owned->at(idx).size() < MERGE_FEATURE_MIN ||
+			   retained_fraction(*inputs.field, cand->prim, inputs.owned->at(idx), others) >= config.merge_retain;
+	};
+	if (!member_ok(lhs) || !member_ok(rhs) || merge_protrusion(*inputs.field, cand->prim) > config.max_protrusion)
 	{
 		return std::nullopt;
 	}
@@ -1460,6 +1478,190 @@ void merge_pass(const DistanceField& field, const SolverConfig& config, std::mt1
 		std::vector<Primitive> merged = without_pair(result, choice.lhs, choice.rhs);
 		merged.push_back(choice.prim);
 		result = std::move(merged);
+	}
+}
+
+// ---- Swallow pass --------------------------------------------------------
+// A merge re-fits one primitive to a PAIR and keeps it only if that fit re-covers
+// the union -- which fails, and so leaves the pair split, when one primitive is a
+// redundant left-over sitting mostly inside another of a very different shape (a
+// box overlapping a wheel cylinder). The swallow pass targets exactly that: a
+// primitive already mostly covered by the rest is absorbed by growing its dominant
+// coverer (warm-started from that primitive, so it keeps its shape and just
+// inflates over the left-over) and then dropped. Being gated on redundancy, it can
+// never swallow a distinct feature -- a rocket fin is not mostly covered by
+// anything, so it is never a candidate.
+
+constexpr float SWALLOW_COVER  = 0.80F; // a primitive this covered by the rest is a swallow candidate
+constexpr float SWALLOW_RETAIN = 0.90F; // the grown coverer must still hold this much of BOTH primitives
+
+// Decode a placed primitive back into optimiser parameters, to warm-start a re-fit
+// from that primitive (keep its shape, just grow it).
+[[nodiscard]] std::pair<Kind, FitParams> to_fit_params(const Primitive& prim)
+{
+	if (std::holds_alternative<Sphere>(prim))
+	{
+		const Sphere sphere = std::get<Sphere>(prim);
+		return {Kind::SPHERE, {.pos = sphere.pos, .dims = vec3(sphere.radius, 0.0F, 0.0F), .rot = {}}};
+	}
+	if (std::holds_alternative<Box>(prim))
+	{
+		const Box box = std::get<Box>(prim);
+		return {Kind::BOX, {.pos = box.pos, .dims = box.size, .rot = box.rot}};
+	}
+	const Cylinder cyl = std::get<Cylinder>(prim);
+	return {Kind::CYLINDER, {.pos = cyl.pos, .dims = vec3(cyl.radius, cyl.height, 0.0F), .rot = cyl.rot}};
+}
+
+// Fraction of `part`'s nodes covered by any primitive in `prims`.
+[[nodiscard]] float covered_fraction(const DistanceField& field, const std::vector<std::size_t>& part,
+									 const std::vector<Primitive>& prims)
+{
+	if (part.empty())
+	{
+		return 0.0F;
+	}
+	const auto covered = static_cast<std::size_t>(std::ranges::count_if(
+		part,
+		[&field, &prims](std::size_t node)
+		{
+			const Vec3 pos = node_position_of(field, node);
+			return std::ranges::any_of(prims, [pos](const Primitive& prim) { return sd_primitive(pos, prim) <= 0.0F; });
+		}));
+	return static_cast<float>(covered) / static_cast<float>(part.size());
+}
+
+// Index of the primitive (other than `self`) that covers the most of `part`, or
+// `self` if none covers any of it.
+[[nodiscard]] std::size_t dominant_coverer(const DistanceField& field, const std::vector<std::size_t>& part,
+										   const std::vector<Primitive>& prims, std::size_t self)
+{
+	std::size_t best	   = self;
+	std::size_t best_count = 0;
+	for (std::size_t idx = 0; idx < prims.size(); ++idx)
+	{
+		if (idx == self)
+		{
+			continue;
+		}
+		const auto count = static_cast<std::size_t>(std::ranges::count_if(
+			part, [&field, &prims, idx](std::size_t node)
+			{ return sd_primitive(node_position_of(field, node), prims.at(idx)) <= 0.0F; }));
+		if (count > best_count)
+		{
+			best_count = count;
+			best	   = idx;
+		}
+	}
+	return best;
+}
+
+// Grow `keeper` (warm-started from itself) to also cover `absorbed`'s region, so it
+// can take over that primitive's territory before it is dropped.
+[[nodiscard]] Fit grow_over(const DistanceField& field, const std::vector<std::size_t>& region,
+							const Primitive& keeper, const std::vector<Primitive>& others, const SolverConfig& config,
+							std::mt19937& rng)
+{
+	const RegionFit				   frame   = region_fit(field, region);
+	const std::vector<SamplePoint> samples = oriented_samples(field, frame.seed, frame.window, config, rng);
+	const std::vector<float>	   weight  = compute_weights(samples, others);
+	const float					   scale   = frame.seed.clearance;
+	const Context				   context = {.samples = &samples,
+											  .weight  = &weight,
+											  .tau	   = config.occupancy_tau * scale,
+											  .lambda  = config.protrusion_weight};
+	const auto [kind, params]			   = to_fit_params(keeper);
+	return optimize(kind, params, context, config, scale);
+}
+
+// One accepted swallow: index of the redundant primitive to drop, the dominant
+// coverer to replace, and the grown primitive that replaces it.
+struct Swallow
+{
+	std::size_t drop{0};
+	std::size_t keep{0};
+	Primitive	grown;
+	bool		found{false};
+};
+
+[[nodiscard]] Swallow find_swallow(const DistanceField& field, const std::vector<Primitive>& result,
+								   const std::vector<std::vector<std::size_t>>& owned, const SolverConfig& config,
+								   std::mt19937& rng)
+{
+	for (std::size_t drop = 0; drop < result.size(); ++drop)
+	{
+		if (owned.at(drop).size() < MERGE_MIN_REGION)
+		{
+			continue;
+		}
+		const std::vector<Primitive> without_drop = without_pair(result, drop, drop);
+		if (covered_fraction(field, owned.at(drop), without_drop) < SWALLOW_COVER)
+		{
+			continue; // not redundant -- a distinct feature, never swallowed
+		}
+		const std::size_t keep = dominant_coverer(field, owned.at(drop), result, drop);
+		if (keep == drop)
+		{
+			continue;
+		}
+		const std::vector<Primitive>   others = without_pair(result, drop, keep);
+		const std::vector<std::size_t> region = region_union(owned.at(drop), owned.at(keep));
+		const Fit					   grown  = grow_over(field, region, result.at(keep), others, config, rng);
+		if (merge_protrusion(field, grown.prim) <= config.max_protrusion &&
+			retained_fraction(field, grown.prim, owned.at(drop), others) >= SWALLOW_RETAIN &&
+			retained_fraction(field, grown.prim, owned.at(keep), others) >= SWALLOW_RETAIN)
+		{
+			return {.drop = drop, .keep = keep, .grown = grown.prim, .found = true};
+		}
+	}
+	return {};
+}
+
+void swallow_pass(const DistanceField& field, const SolverConfig& config, std::mt19937& rng,
+				  std::vector<Primitive>& result)
+{
+	while (result.size() > 1)
+	{
+		const std::vector<std::vector<std::size_t>> owned	= owned_nodes(field, result);
+		const Swallow								swallow = find_swallow(field, result, owned, config, rng);
+		if (!swallow.found)
+		{
+			break;
+		}
+		std::vector<Primitive> kept = without_pair(result, swallow.drop, swallow.keep);
+		kept.push_back(swallow.grown);
+		result = std::move(kept);
+	}
+}
+
+// Drop primitives that contribute no coverage of their own -- every interior node
+// they hold is also held by some other primitive. These are the degenerate left-
+// overs the greedy places chasing the last fraction of a percent (sub-voxel spheres,
+// flattened boxes) plus anything the merge/swallow left fully buried inside a
+// neighbour. They are invisible to the merge (no unique region to share) and slip
+// past the swallow (its grow step can perturb the keeper), so they linger as pure
+// clutter; dropping a primitive whose coverage is entirely redundant is exactly
+// lossless. Done one at a time, re-checking after each removal, so two primitives
+// that merely overlap each other are never both dropped.
+void prune_redundant(const DistanceField& field, std::vector<Primitive>& result)
+{
+	while (result.size() > 1)
+	{
+		const std::vector<std::vector<std::size_t>> owned = owned_nodes(field, result);
+		std::size_t									redundant = result.size();
+		for (std::size_t idx = 0; idx < result.size(); ++idx)
+		{
+			if (covered_fraction(field, owned.at(idx), without_pair(result, idx, idx)) >= 1.0F)
+			{
+				redundant = idx;
+				break;
+			}
+		}
+		if (redundant == result.size())
+		{
+			break;
+		}
+		result.erase(result.begin() + static_cast<std::ptrdiff_t>(redundant));
 	}
 }
 
@@ -1535,10 +1737,15 @@ std::vector<Primitive> decompose(const TriMesh& mesh, const SolverConfig& config
 	}
 
 	// Consolidation: fold adjacent primitives into single re-fitted ones where a
-	// lone primitive covers the pair just as well, trimming the count.
+	// lone primitive covers the pair just as well, then swallow any primitive left
+	// sitting mostly inside another by growing that one over it, and finally prune
+	// any degenerate zero-coverage left-overs -- all three trim the count without
+	// giving up coverage.
 	if (config.merge_primitives)
 	{
 		merge_pass(field, config, rng, result);
+		swallow_pass(field, config, rng, result);
+		prune_redundant(field, result);
 	}
 	return result;
 }

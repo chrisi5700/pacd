@@ -229,6 +229,42 @@ namespace
 	const Cylinder cyl = std::get<Cylinder>(prim);
 	return cyl.radius + cyl.height;
 }
+
+// True if any primitive other than `self` covers `pos`.
+[[nodiscard]] bool covered_by_other(const std::vector<Primitive>& parts, std::size_t self, Vec3 pos)
+{
+	for (std::size_t idx = 0; idx < parts.size(); ++idx)
+	{
+		if (idx != self && sd_primitive(pos, parts.at(idx)) <= 0.0F)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+// True if `parts[self]` holds at least one interior grid node that no other
+// primitive holds -- its own, non-redundant contribution to the union.
+[[nodiscard]] bool has_exclusive_interior(const DistanceField& field, const std::vector<Primitive>& parts,
+										  std::size_t self)
+{
+	for (int ciz = 0; ciz < field.nz; ++ciz)
+	{
+		for (int ciy = 0; ciy < field.ny; ++ciy)
+		{
+			for (int cix = 0; cix < field.nx; ++cix)
+			{
+				const Vec3 pos = field.node_position(cix, ciy, ciz);
+				if (field.at_index(cix, ciy, ciz) < 0.0F && sd_primitive(pos, parts.at(self)) <= 0.0F &&
+					!covered_by_other(parts, self, pos))
+				{
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
 } // namespace
 
 TEST_CASE("decompose fills a cube with a single oriented box", "[decompose]")
@@ -325,6 +361,25 @@ TEST_CASE("merging never increases the count and preserves coverage", "[decompos
 	{
 		const Vec3 lobe = vec3(shift, 0.0F, 0.0F);
 		REQUIRE(std::ranges::any_of(merged, [lobe](const Primitive& prim) { return sd_primitive(lobe, prim) <= 0.0F; }));
+	}
+}
+
+TEST_CASE("consolidation leaves no primitive whose coverage is fully redundant", "[decompose]")
+{
+	// After merge/swallow/prune every kept primitive must hold interior of its own:
+	// prune_redundant drops any primitive whose every interior node is also covered
+	// by the rest (sub-voxel degenerates, fully-buried left-overs). Checked on the
+	// same grid the solver prunes against, so the postcondition is exact.
+	const TriMesh	   mesh	  = test::make_two_box_mesh(0.8F, 1.2F);
+	const SolverConfig config = fast_config();
+
+	const std::vector<Primitive> parts = decompose(mesh, config);
+	REQUIRE(parts.size() >= 2);
+
+	const DistanceField field = build_distance_field(mesh, config.sdf_resolution, config.bbox_padding);
+	for (std::size_t self = 0; self < parts.size(); ++self)
+	{
+		REQUIRE(has_exclusive_interior(field, parts, self)); // else it would have been pruned
 	}
 }
 

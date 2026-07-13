@@ -85,12 +85,36 @@ the mesh surface).
   interior (warm-started from the region's oriented bounding frame, then the same
   gradient-descent inner loop, so a slightly misaligned pair is polished into a
   proper single fit) and keeps the merge only if that lone primitive re-covers at
-  least `merge_retain` of the pair — counting interior any *surviving* primitive
-  still holds, so a merge can never open a hole another primitive already fills.
-  Applied greedily (largest region first, repeated to a fixpoint), it collapses a
-  whole cluster and trades primitive count for a bounded, tunable coverage
-  give-back — on the composite corpus this roughly halves the primitive count at
-  a fraction of a percent of mean IoU.
+  least `merge_retain` of **each member** — counting interior any *surviving*
+  primitive still holds, so a merge can never open a hole another primitive already
+  fills. The retain test is **per-primitive, not over the union**: a lone fin holds
+  only a handful of a big body's nodes, so a union fraction would round its loss to
+  zero and let the body swallow it — the cascade that otherwise collapses a whole
+  rocket to a single cylinder. Members too small to be a real feature (below
+  `MERGE_FEATURE_MIN` grid nodes — aliasing debris the greedy left behind) are
+  exempt, so that debris is still absorbed. Applied greedily (largest region first,
+  repeated to a fixpoint), it collapses a cluster while leaving distinct features
+  standing — on the composite corpus this cuts primitive count *and* nudges mean
+  IoU up.
+
+- **Swallow redundant leftovers.** A merge re-fits one primitive to a *pair* and
+  so leaves them split when one is a redundant left-over sitting mostly inside
+  another of a very different shape (a box overlapping a wheel cylinder — the
+  joint re-fit can't cover the union). A follow-up pass targets exactly that: a
+  primitive already mostly covered by the *rest* is absorbed by **growing its
+  dominant coverer over it** (warm-started from that coverer, so it keeps its
+  shape and just inflates) and then dropped, provided the grown primitive still
+  holds nearly all of both. Being gated on redundancy, it can only ever remove a
+  primitive another already covers — a distinct feature (a rocket fin, covered by
+  nothing else) is never a candidate, so coverage is preserved while the count
+  falls further.
+
+- **Prune redundant left-overs.** A final sweep drops any primitive whose interior
+  is *entirely* held by the others — sub-voxel degenerates the greedy placed
+  chasing the last fraction of a percent, and anything the merge/swallow left fully
+  buried. Removing a primitive that contributes no coverage of its own is exactly
+  lossless; done one at a time and re-checked, two primitives that merely overlap
+  are never both dropped.
 
 - **Termination.** Stop at *x %* of the interior filled **or** *n* primitives,
   whichever trips first. The tail (concave corners, thin features) is expensive
