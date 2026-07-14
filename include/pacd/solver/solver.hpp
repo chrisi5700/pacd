@@ -17,13 +17,13 @@
 namespace pacd::solver
 {
 
-// Tunable knobs for a single decomposition run. Defaults are provisional
-// starting points, not tuned values.
+// Tunable knobs for a single decomposition run. Defaults mirror the interactive
+// viewer's working configuration (see viewer_config() in viewer_main.cpp).
 struct SolverConfig
 {
 	// Termination -- stop at whichever trips first.
 	float target_coverage{0.95F}; // fraction of interior volume to fill, in [0, 1]
-	int	  max_primitives{32};	  // hard cap on the number of primitives placed
+	int	  max_primitives{24};	  // hard cap on the number of primitives placed
 
 	// Volume sampling: the mesh SDF and interior coverage are evaluated on a grid
 	// whose longest axis spans this many cells.
@@ -31,7 +31,7 @@ struct SolverConfig
 
 	// Inner loop: gradient descent inflating one inscribed primitive. Step sizes
 	// scale with the local seed clearance, so learning_rate is dimensionless.
-	int	  gd_iterations{150};
+	int	  gd_iterations{300};
 	float learning_rate{0.03F};
 
 	// Softness. `occupancy_tau` is the sigmoid width used to turn an SDF into a
@@ -47,7 +47,7 @@ struct SolverConfig
 
 	// Monte-Carlo integration points for the inner-loop objective, and the RNG
 	// seed that places them (fixed for determinism).
-	int		 sample_count{4096};
+	int		 sample_count{1200};
 	unsigned seed{1337U};
 
 	// Bounding-box padding (fraction of the diagonal) for the distance field, so

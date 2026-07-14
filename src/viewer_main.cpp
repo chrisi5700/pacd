@@ -227,11 +227,9 @@ void print_usage()
 
 [[nodiscard]] solver::SolverConfig viewer_config()
 {
+	// The numeric knobs (resolution, samples, GD iterations, primitive budget) are
+	// the SolverConfig defaults; the viewer only adds progress logging on top.
 	solver::SolverConfig config;
-	config.sdf_resolution = 64;
-	config.sample_count	  = 1200;
-	config.gd_iterations  = 300;
-	config.max_primitives = 24;
 	config.on_field_built = [] { fmt::print(stderr, "  distance field built; fitting primitives...\n"); };
 	config.on_primitive	  = [](std::size_t placed, const solver::Primitive& prim)
 	{ fmt::print(stderr, "  placed primitive {} ({})\n", placed, prim.kind_name()); };
