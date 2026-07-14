@@ -88,8 +88,8 @@ DistanceField build_distance_field(const TriMesh& mesh, int resolution, float pa
 	// state, no ordering -- so the grid fills in parallel with zero synchronisation:
 	// contiguous flat-index ranges are handed to worker threads that write disjoint
 	// slots. The result matches a serial fill; parallelism only changes wall-clock.
-	const std::size_t total = field.node_count();
-	const auto		  cores = static_cast<std::size_t>(std::max(1U, std::thread::hardware_concurrency()));
+	const std::size_t total	  = field.node_count();
+	const auto		  cores	  = static_cast<std::size_t>(std::max(1U, std::thread::hardware_concurrency()));
 	const std::size_t workers = std::max<std::size_t>(1, std::min(cores, total));
 
 	// The fast winding number is approximate, and its tree-ordered sum rounds a hair

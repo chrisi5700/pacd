@@ -165,7 +165,6 @@ namespace
 	return config;
 }
 
-
 // A scalar summary of a primitive's dimensions -- identical for exact replicas.
 [[nodiscard]] float primitive_size_signature(const Primitive& prim)
 {
@@ -295,12 +294,12 @@ TEST_CASE("merging never increases the count and preserves coverage", "[decompos
 	const float	  offset = 1.4F;
 	const TriMesh mesh	 = test::make_two_box_mesh(0.8F, offset);
 
-	SolverConfig base	  = fast_config();
-	base.sdf_resolution	  = 28;
-	base.use_symmetry	  = false; // isolate the merge behaviour from replication
+	SolverConfig base	= fast_config();
+	base.sdf_resolution = 28;
+	base.use_symmetry	= false; // isolate the merge behaviour from replication
 
-	SolverConfig no_merge	= base;
-	no_merge.merge_primitives = false;
+	SolverConfig no_merge		= base;
+	no_merge.merge_primitives	= false;
 	SolverConfig with_merge		= base;
 	with_merge.merge_primitives = true;
 
@@ -312,7 +311,8 @@ TEST_CASE("merging never increases the count and preserves coverage", "[decompos
 	for (const float shift : {offset, -offset}) // both lobes stay covered after merging
 	{
 		const Vec3 lobe = vec3(shift, 0.0F, 0.0F);
-		REQUIRE(std::ranges::any_of(merged, [lobe](const Primitive& prim) { return sd_primitive(lobe, prim) <= 0.0F; }));
+		REQUIRE(
+			std::ranges::any_of(merged, [lobe](const Primitive& prim) { return sd_primitive(lobe, prim) <= 0.0F; }));
 	}
 }
 
@@ -362,11 +362,11 @@ TEST_CASE("decompose replicates primitives across a mirror symmetry", "[decompos
 		const bool	paired = std::ranges::any_of(parts,
 												 [&](const Primitive& other)
 												 {
-													const Vec3 other_c = other.center();
-													return std::abs(sig - primitive_size_signature(other)) < EPS &&
-														   std::abs(other_c.x + center.x) < 0.15F &&
-														   std::abs(other_c.y - center.y) < 0.15F &&
-														   std::abs(other_c.z - center.z) < 0.15F;
+													 const Vec3 other_c = other.center();
+													 return std::abs(sig - primitive_size_signature(other)) < EPS &&
+															std::abs(other_c.x + center.x) < 0.15F &&
+															std::abs(other_c.y - center.y) < 0.15F &&
+															std::abs(other_c.z - center.z) < 0.15F;
 												 });
 		REQUIRE(paired);
 	}

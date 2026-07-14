@@ -30,42 +30,34 @@ each part earns its place.
 <table>
   <tr>
     <td align="center" width="50%">
-      <img src="img/pacd-shot-4.png" width="380" alt="table decomposed into a box slab and four cylinder legs"><br>
-      <sub>A table: one box for the slab, four cylinders for the legs.</sub>
+      <img src="img/pacd-shot-4.png" width="380" alt="table decomposed into a box slab and four cylinder legs">
     </td>
     <td align="center" width="50%">
-      <img src="img/pacd-shot-2.png" width="380" alt="L-bracket decomposed into two boxes"><br>
-      <sub>An L-bracket collapsed to just two boxes after the merge pass.</sub>
+      <img src="img/pacd-shot-2.png" width="380" alt="L-bracket decomposed into two boxes">
     </td>
   </tr>
   <tr>
     <td align="center" width="50%">
-      <img src="img/pacd-shot-0.png" width="380" alt="composite of a box and a cylinder"><br>
-      <sub>Box + cylinder composite — heterogeneous vocabulary in miniature.</sub>
+      <img src="img/pacd-shot-0.png" width="380" alt="composite of a box and a cylinder">
     </td>
     <td align="center" width="50%">
-      <img src="img/pacd-shot-3.png" width="380" alt="three stacked spheres of decreasing size"><br>
-      <sub>Rounded caps fall out naturally as spheres.</sub>
+      <img src="img/pacd-shot-3.png" width="380" alt="three stacked spheres of decreasing size">
     </td>
   </tr>
   <tr>
     <td align="center" width="50%">
-      <img src="img/pacd-shot-1.png" width="380" alt="interlocking beams captured as boxes"><br>
-      <sub>Interlocking beams, each a box; symmetry replicates the fits.</sub>
+      <img src="img/pacd-shot-1.png" width="380" alt="interlocking beams captured as boxes">
     </td>
     <td align="center" width="50%">
-      <img src="img/pacd-shot-6.png" width="380" alt="hex-head bolt decomposed into cylinders"><br>
-      <sub>A hex-head bolt: cylinders for the head, shaft and tip.</sub>
+      <img src="img/pacd-shot-6.png" width="380" alt="hex-head bolt decomposed into cylinders">
     </td>
   </tr>
   <tr>
     <td align="center" width="50%">
-      <img src="img/pacd-shot-7.png" width="380" alt="thumb screw decomposed into a disc and shaft"><br>
-      <sub>A thumb screw — a broad cylinder disc feeding a slender shaft.</sub>
+      <img src="img/pacd-shot-7.png" width="380" alt="thumb screw decomposed into a disc and shaft">
     </td>
     <td align="center" width="50%">
-      <img src="img/pacd-shot-5.png" width="380" alt="threaded screw approximated by stacked cylinders"><br>
-      <sub>A threaded screw approximated by cylinders marching down the shaft.</sub>
+      <img src="img/pacd-shot-5.png" width="380" alt="threaded screw approximated by stacked cylinders">
     </td>
   </tr>
 </table>

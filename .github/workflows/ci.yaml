@@ -38,9 +38,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install clang-format
+        # Pinned so the check is reproducible: apt's clang-format floats with the
+        # runner image, and formatting output differs across major versions.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang-format
+          pipx install clang-format==18.1.8
+          clang-format --version
 
       - name: Check formatting
         run: |
@@ -56,18 +58,27 @@ jobs:
         with:
           vcpkgGitCommitId: '6d7bf7ef2193e2d1c5798a5ff8811d533104c861'
 
-      - name: Install Clang + analysis tools
+      - name: Install Clang 19 + analysis tools
+        # Ubuntu's default clang/clang-tidy is 18, which is too old to parse the
+        # runner's libstdc++ C++23 headers (std::expected) and errors out during
+        # analysis. Pull clang + clang-tidy 19 from apt.llvm.org instead.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang clang-tidy cppcheck
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 19
+          sudo apt-get install -y -qq clang-tidy-19 cppcheck \
+            libxinerama-dev libxcursor-dev xorg-dev libglu1-mesa-dev
+          clang++-19 --version
+          clang-tidy-19 --version
 
       - uses: lukka/run-cmake@v10
         with:
           configurePreset: dev-vcpkg
           configurePresetAdditionalArgs: >
-            ["-DCMAKE_CXX_COMPILER=clang++",
+            ["-DCMAKE_CXX_COMPILER=clang++-19",
              "-DENABLE_CLANG_TIDY=ON",
-             "-DENABLE_CPPCHECK=ON"]
+             "-DENABLE_CPPCHECK=ON",
+             "-DCLANG_TIDY_EXE=/usr/bin/clang-tidy-19"]
           buildPreset: dev-vcpkg
 
       - name: Test
@@ -85,13 +96,16 @@ jobs:
       - name: Install GCC + lcov
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc g++ lcov
+          sudo apt-get install -y -qq gcc g++ lcov \
+            libxinerama-dev libxcursor-dev xorg-dev libglu1-mesa-dev
 
       - uses: lukka/run-cmake@v10
         with:
           configurePreset: dev-vcpkg
           configurePresetAdditionalArgs: >
-            ["-DCMAKE_CXX_COMPILER=g++"]
+            ["-DCMAKE_CXX_COMPILER=g++",
+             "-DENABLE_CLANG_TIDY=OFF",
+             "-DENABLE_CPPCHECK=OFF"]
           buildPreset: dev-vcpkg
 
       - name: Run tests + coverage
